@@ -260,6 +260,18 @@ func (s *Server) CRImportCheckpoint(
 		if dumpSpec.Linux.ReadonlyPaths != nil {
 			containerConfig.Linux.SecurityContext.ReadonlyPaths = dumpSpec.Linux.ReadonlyPaths
 		}
+
+		if dumpSpec.Linux.Devices != nil {
+                	for _, d := range dumpSpec.Linux.Devices {
+                              	device := &types.Device{
+                                      	ContainerPath: d.Path,
+                                       	HostPath:      d.Path,
+                                       	Permissions:   "rw",
+                               	}
+
+                               	containerConfig.Devices = append(containerConfig.Devices, device)
+                       	}
+               	}
 	}
 
 	ignoreMounts := map[string]bool{
