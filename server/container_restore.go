@@ -44,7 +44,7 @@ func isNVIDIASystemPath(path string) bool {
 		"/etc/vulkan/icd.d/nvidia_",
 		"/etc/vulkan/implicit_layer.d/nvidia_",
 		"/run/nvidia-persistenced/",
-		"/usr/bin/nvidia-cuda-mps-control"
+		"/usr/bin/nvidia-cuda-mps-control",
 	}
 	
 	for _, prefix := range nvidiaPrefixes {
