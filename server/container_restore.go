@@ -21,6 +21,41 @@ import (
 	"github.com/cri-o/cri-o/pkg/annotations"
 )
 
+// isNVIDIASystemPath checks if a mount path is an NVIDIA system path that's safe to skip during restore
+func isNVIDIASystemPath(path string) bool {
+	nvidiaPrefixes := []string{
+		"/usr/bin/nvidia-",
+		"/usr/lib/x86_64-linux-gnu/libEGL_nvidia.",
+		"/usr/lib/x86_64-linux-gnu/libGLESv1_CM_nvidia.",
+		"/usr/lib/x86_64-linux-gnu/libGLESv2_nvidia.",
+		"/usr/lib/x86_64-linux-gnu/libGLX_nvidia.",
+		"/usr/lib/x86_64-linux-gnu/libcuda.",
+		"/usr/lib/x86_64-linux-gnu/libcudadebugger.",
+		"/usr/lib/x86_64-linux-gnu/libnvcuvid.",
+		"/usr/lib/x86_64-linux-gnu/libnvidia-",
+		"/usr/lib/x86_64-linux-gnu/libnvoptix.",
+		"/usr/lib/x86_64-linux-gnu/nvidia/",
+		"/usr/lib/x86_64-linux-gnu/vdpau/libvdpau_nvidia.",
+		"/usr/share/nvidia/",
+		"/usr/share/X11/xorg.conf.d/",
+		"/usr/share/egl/egl_external_platform.d/",
+		"/usr/share/glvnd/egl_vendor.d/",
+		"/lib/firmware/nvidia/",
+		"/etc/vulkan/icd.d/nvidia_",
+		"/etc/vulkan/implicit_layer.d/nvidia_",
+		"/run/nvidia-persistenced/",
+		"/usr/bin/nvidia-cuda-mps-control"
+	}
+	
+	for _, prefix := range nvidiaPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	
+	return false
+}
+
 // checkIfCheckpointOCIImage returns checks if the input refers to a checkpoint image.
 // It returns the StorageImageID of the image the input resolves to, nil otherwise.
 func (s *Server) checkIfCheckpointOCIImage(ctx context.Context, input string) (*storage.StorageImageID, error) {
@@ -260,6 +295,18 @@ func (s *Server) CRImportCheckpoint(
 		if dumpSpec.Linux.ReadonlyPaths != nil {
 			containerConfig.Linux.SecurityContext.ReadonlyPaths = dumpSpec.Linux.ReadonlyPaths
 		}
+
+		if dumpSpec.Linux.Devices != nil {
+                	for _, d := range dumpSpec.Linux.Devices {
+                              	device := &types.Device{
+                                      	ContainerPath: d.Path,
+                                       	HostPath:      d.Path,
+                                       	Permissions:   "rw",
+                               	}
+
+                               	containerConfig.Devices = append(containerConfig.Devices, device)
+                       	}
+               	}
 	}
 
 	ignoreMounts := map[string]bool{
@@ -324,11 +371,27 @@ func (s *Server) CRImportCheckpoint(
 	}
 
 	if len(missingMount) > 0 {
-		return "", fmt.Errorf(
-			"restoring %q expects following bind mounts defined (%s)",
-			inputImage,
-			strings.Join(missingMount, ","),
-		)
+		// Filter out system paths that are safe to skip
+		unsafeMounts := []string{}
+		for _, mount := range missingMount {
+			// Allow skipping NVIDIA-related system paths
+			if isNVIDIASystemPath(mount) {
+				log.Debugf(ctx, "Skipping NVIDIA system mount: %s", mount)
+				continue
+			}
+			// Add other known safe system paths here as needed
+			unsafeMounts = append(unsafeMounts, mount)
+		}
+		
+		if len(unsafeMounts) > 0 {
+			return "", fmt.Errorf(
+				"restoring %q expects following bind mounts defined (%s)",
+				inputImage,
+				strings.Join(unsafeMounts, ","),
+			)
+		} else {
+			log.Infof(ctx, "Skipped %d system mount paths during restore", len(missingMount))
+		}
 	}
 
 	sandboxConfig := &types.PodSandboxConfig{
