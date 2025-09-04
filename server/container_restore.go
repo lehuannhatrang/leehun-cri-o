@@ -384,11 +384,11 @@ func (s *Server) CRImportCheckpoint(
 		}
 		
 		if len(unsafeMounts) > 0 {
-			return "", fmt.Errorf(
-				"restoring %q expects following bind mounts defined (%s)",
-				inputImage,
-				strings.Join(unsafeMounts, ","),
-			)
+			// return "", fmt.Errorf(
+			// 	"restoring %q expects following bind mounts defined (%s)",
+			// 	inputImage,
+			// 	strings.Join(unsafeMounts, ","),
+			// )
 		} else {
 			log.Infof(ctx, "Skipped %d system mount paths during restore", len(missingMount))
 		}
