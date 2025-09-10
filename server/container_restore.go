@@ -48,6 +48,7 @@ func IsNVIDIAMount(path string) bool {
 		"/usr/share/egl/egl_external_platform.d/",
 		"/usr/share/glvnd/egl_vendor.d/",
 		"/lib/firmware/nvidia/",
+		"/usr/lib/firmware/nvidia/",
 		"/etc/vulkan/icd.d/nvidia_",
 		"/etc/vulkan/implicit_layer.d/nvidia_",
 		"/run/nvidia-persistenced/",
@@ -127,9 +128,11 @@ func hasOption(options []string, option string) bool {
 
 // NVIDIADriverInfo contains information about available NVIDIA drivers on the node
 type NVIDIADriverInfo struct {
-	DriverVersion string
-	LibraryPaths  map[string]string // maps library basename to full path
-	BinaryPaths   map[string]string // maps binary basename to full path
+	DriverVersion     string
+	LibraryPaths      map[string]string            // maps library basename to full path
+	BinaryPaths       map[string]string            // maps binary basename to full path
+	FirmwarePaths     map[string]string            // maps firmware filename to full path
+	FirmwareByVersion map[string]map[string]string // version -> (filename -> full path)
 }
 
 // Global cache for NVIDIA driver detection to avoid repeated filesystem scans
@@ -143,8 +146,10 @@ func detectNVIDIADrivers(ctx context.Context) (*NVIDIADriverInfo, error) {
 		return nvidiaDriverCache, nil
 	}
 	info := &NVIDIADriverInfo{
-		LibraryPaths: make(map[string]string),
-		BinaryPaths:  make(map[string]string),
+		LibraryPaths:      make(map[string]string),
+		BinaryPaths:       make(map[string]string),
+		FirmwarePaths:     make(map[string]string),
+		FirmwareByVersion: make(map[string]map[string]string),
 	}
 
 	// Common NVIDIA library search paths
@@ -168,6 +173,12 @@ func detectNVIDIADrivers(ctx context.Context) (*NVIDIADriverInfo, error) {
 		"/usr/bin",
 		"/bin",
 		"/usr/local/bin",
+	}
+
+	// Common NVIDIA firmware search paths
+	firmwareSearchPaths := []string{
+		"/usr/lib/firmware/nvidia",
+		"/lib/firmware/nvidia",
 	}
 
 	// Regex patterns for NVIDIA libraries
@@ -242,6 +253,40 @@ func detectNVIDIADrivers(ctx context.Context) (*NVIDIADriverInfo, error) {
 				info.BinaryPaths[cmd] = fullPath
 			}
 		}
+	}
+
+	// Scan for NVIDIA firmware blobs (e.g., gsp_tu10x.bin, gsp_ga10x.bin)
+	for _, fwBase := range firmwareSearchPaths {
+		if _, err := os.Stat(fwBase); os.IsNotExist(err) {
+			continue
+		}
+
+		_ = filepath.Walk(fwBase, func(path string, fileInfo os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if fileInfo.IsDir() {
+				return nil
+			}
+			name := fileInfo.Name()
+			if !strings.HasSuffix(name, ".bin") {
+				return nil
+			}
+			rel, relErr := filepath.Rel(fwBase, path)
+			if relErr != nil {
+				return nil
+			}
+			parts := strings.Split(rel, string(os.PathSeparator))
+			if len(parts) >= 2 {
+				version := parts[0]
+				if _, ok := info.FirmwareByVersion[version]; !ok {
+					info.FirmwareByVersion[version] = make(map[string]string)
+				}
+				info.FirmwareByVersion[version][name] = path
+			}
+			info.FirmwarePaths[name] = path
+			return nil
+		})
 	}
 
 	log.Debugf(ctx, "Detected NVIDIA driver version: %s", info.DriverVersion)
@@ -326,6 +371,34 @@ func mapNVIDIAMountPath(ctx context.Context, checkpointPath string, driverInfo *
 	if binName := filepath.Base(checkpointPath); strings.HasPrefix(binName, "nvidia-") {
 		if nodePath, exists := driverInfo.BinaryPaths[binName]; exists {
 			log.Debugf(ctx, "Mapped NVIDIA binary: %s -> %s", checkpointPath, nodePath)
+			return nodePath, true
+		}
+	}
+
+	// Try to map firmware blobs under /usr/lib/firmware/nvidia/<ver>/gsp_*.bin
+	if strings.Contains(checkpointPath, "/firmware/nvidia/") && strings.HasSuffix(checkpointPath, ".bin") {
+		file := filepath.Base(checkpointPath)
+		// Attempt to extract version directory from checkpoint path
+		version := ""
+		parts := strings.Split(checkpointPath, string(os.PathSeparator))
+		for i := 0; i+2 < len(parts); i++ {
+			if parts[i] == "firmware" && parts[i+1] == "nvidia" {
+				version = parts[i+2]
+				break
+			}
+		}
+		// Prefer same version match
+		if version != "" {
+			if byFile, ok := driverInfo.FirmwareByVersion[version]; ok {
+				if nodePath, ok2 := byFile[file]; ok2 {
+					log.Debugf(ctx, "Mapped NVIDIA firmware (same ver): %s -> %s", checkpointPath, nodePath)
+					return nodePath, true
+				}
+			}
+		}
+		// Fallback: any available same filename
+		if nodePath, ok := driverInfo.FirmwarePaths[file]; ok {
+			log.Debugf(ctx, "Mapped NVIDIA firmware (fallback): %s -> %s", checkpointPath, nodePath)
 			return nodePath, true
 		}
 	}
