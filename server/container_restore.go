@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
@@ -21,8 +23,9 @@ import (
 	"github.com/cri-o/cri-o/pkg/annotations"
 )
 
-// isNVIDIASystemPath checks if a mount path is an NVIDIA system path that's safe to skip during restore
-func isNVIDIASystemPath(path string) bool {
+// IsNVIDIAMount checks if a mount path is an NVIDIA-related mount
+func IsNVIDIAMount(path string) bool {
+	// Check exact prefixes first
 	nvidiaPrefixes := []string{
 		"/usr/bin/nvidia-",
 		"/usr/lib/x86_64-linux-gnu/libEGL_nvidia.",
@@ -46,14 +49,284 @@ func isNVIDIASystemPath(path string) bool {
 		"/run/nvidia-persistenced/",
 		"/usr/bin/nvidia-cuda-mps-control",
 	}
-	
+
 	for _, prefix := range nvidiaPrefixes {
 		if strings.HasPrefix(path, prefix) {
 			return true
 		}
 	}
-	
+
+	// Check for generic NVIDIA patterns in the path
+	lowerPath := strings.ToLower(path)
+	nvidiaKeywords := []string{
+		"nvidia",
+		"cuda",
+		"nvml",
+		"nvenc",
+		"nvdec",
+		"nvcuvid",
+		"nvoptix",
+		"nvcuda",
+	}
+
+	for _, keyword := range nvidiaKeywords {
+		if strings.Contains(lowerPath, keyword) {
+			return true
+		}
+	}
+
+	// Check for GPU device paths
+	if strings.HasPrefix(path, "/dev/nvidia") ||
+		strings.HasPrefix(path, "/dev/nvidiactl") ||
+		strings.HasPrefix(path, "/dev/nvidia-uvm") ||
+		strings.HasPrefix(path, "/dev/nvidia-modeset") {
+		return true
+	}
+
 	return false
+}
+
+// isNVIDIASystemPath checks if a mount path is an NVIDIA system path that's safe to skip during restore
+// This function is kept for backward compatibility but now uses IsNVIDIAMount
+func isNVIDIASystemPath(path string) bool {
+	return IsNVIDIAMount(path)
+}
+
+// createNVIDIAMount creates an NVIDIA mount from the dumpSpec mount information
+func createNVIDIAMount(m spec.Mount) *types.Mount {
+	// Determine propagation mode based on mount options
+	propagation := types.MountPropagation_PROPAGATION_PRIVATE
+	if hasOption(m.Options, "shared") {
+		propagation = types.MountPropagation_PROPAGATION_BIDIRECTIONAL
+	} else if hasOption(m.Options, "slave") {
+		propagation = types.MountPropagation_PROPAGATION_HOST_TO_CONTAINER
+	}
+
+	return &types.Mount{
+		ContainerPath:     m.Destination,
+		HostPath:          m.Source,
+		Readonly:          hasOption(m.Options, "ro"),
+		RecursiveReadOnly: false, // NVIDIA mounts typically don't need recursive readonly
+		Propagation:       propagation,
+	}
+}
+
+// hasOption checks if a mount option is present in the options slice
+func hasOption(options []string, option string) bool {
+	for _, opt := range options {
+		if opt == option {
+			return true
+		}
+	}
+	return false
+}
+
+// NVIDIADriverInfo contains information about available NVIDIA drivers on the node
+type NVIDIADriverInfo struct {
+	DriverVersion string
+	LibraryPaths  map[string]string // maps library basename to full path
+	BinaryPaths   map[string]string // maps binary basename to full path
+}
+
+// Global cache for NVIDIA driver detection to avoid repeated filesystem scans
+var nvidiaDriverCache *NVIDIADriverInfo
+
+// detectNVIDIADrivers scans the system for available NVIDIA drivers and libraries
+func detectNVIDIADrivers(ctx context.Context) (*NVIDIADriverInfo, error) {
+	// Return cached result if available
+	if nvidiaDriverCache != nil {
+		log.Debugf(ctx, "Using cached NVIDIA driver information")
+		return nvidiaDriverCache, nil
+	}
+	info := &NVIDIADriverInfo{
+		LibraryPaths: make(map[string]string),
+		BinaryPaths:  make(map[string]string),
+	}
+
+	// Common NVIDIA library search paths
+	libSearchPaths := []string{
+		"/usr/lib/x86_64-linux-gnu",
+		"/usr/lib64",
+		"/usr/lib",
+		"/lib/x86_64-linux-gnu",
+		"/lib64",
+		"/lib",
+	}
+
+	// Common NVIDIA binary search paths
+	binSearchPaths := []string{
+		"/usr/bin",
+		"/bin",
+		"/usr/local/bin",
+	}
+
+	// Regex patterns for NVIDIA libraries
+	nvidiaLibPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`^libEGL_nvidia\.so\.(.+)$`),
+		regexp.MustCompile(`^libGLESv1_CM_nvidia\.so\.(.+)$`),
+		regexp.MustCompile(`^libGLESv2_nvidia\.so\.(.+)$`),
+		regexp.MustCompile(`^libGLX_nvidia\.so\.(.+)$`),
+		regexp.MustCompile(`^libcuda\.so\.(.+)$`),
+		regexp.MustCompile(`^libcudadebugger\.so\.(.+)$`),
+		regexp.MustCompile(`^libnvcuvid\.so\.(.+)$`),
+		regexp.MustCompile(`^libnvidia-(.+)\.so\.(.+)$`),
+		regexp.MustCompile(`^libnvoptix\.so\.(.+)$`),
+		regexp.MustCompile(`^libvdpau_nvidia\.so\.(.+)$`),
+	}
+
+	// Scan for NVIDIA libraries
+	for _, searchPath := range libSearchPaths {
+		if _, err := os.Stat(searchPath); os.IsNotExist(err) {
+			continue
+		}
+
+		err := filepath.Walk(searchPath, func(path string, fileInfo os.FileInfo, err error) error {
+			if err != nil {
+				return nil // Continue on error
+			}
+
+			if fileInfo.IsDir() {
+				return nil
+			}
+
+			filename := fileInfo.Name()
+			for _, pattern := range nvidiaLibPatterns {
+				if matches := pattern.FindStringSubmatch(filename); matches != nil {
+					// Extract base library name without version
+					baseName := getBaseLibraryName(filename)
+					if baseName != "" {
+						info.LibraryPaths[baseName] = path
+
+						// Extract driver version from the first match
+						if info.DriverVersion == "" && len(matches) > 1 {
+							info.DriverVersion = matches[len(matches)-1]
+						}
+					}
+					break
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			log.Debugf(ctx, "Error walking path %s: %v", searchPath, err)
+		}
+	}
+
+	// Scan for NVIDIA binaries
+	nvidiaCommands := []string{
+		"nvidia-smi",
+		"nvidia-ml-py",
+		"nvidia-cuda-mps-control",
+		"nvidia-cuda-mps-server",
+		"nvidia-debugdump",
+		"nvidia-persistenced",
+		"nvidia-modprobe",
+	}
+
+	for _, searchPath := range binSearchPaths {
+		for _, cmd := range nvidiaCommands {
+			fullPath := filepath.Join(searchPath, cmd)
+			if _, err := os.Stat(fullPath); err == nil {
+				info.BinaryPaths[cmd] = fullPath
+			}
+		}
+	}
+
+	log.Debugf(ctx, "Detected NVIDIA driver version: %s", info.DriverVersion)
+	log.Debugf(ctx, "Found %d NVIDIA libraries and %d binaries", len(info.LibraryPaths), len(info.BinaryPaths))
+
+	// Cache the result for future use
+	nvidiaDriverCache = info
+
+	return info, nil
+}
+
+// getBaseLibraryName extracts the base name of an NVIDIA library without version info
+func getBaseLibraryName(filename string) string {
+	// Remove version numbers and get base name
+	// e.g., "libEGL_nvidia.so.575.64.03" -> "libEGL_nvidia.so"
+	versionPattern := regexp.MustCompile(`\.so\.[\d.]+$`)
+	baseName := versionPattern.ReplaceAllString(filename, ".so")
+
+	// Also handle cases like "libnvidia-ml.so.1" -> "libnvidia-ml.so"
+	if strings.HasSuffix(baseName, ".so") {
+		return baseName
+	}
+
+	return ""
+}
+
+// extractDriverVersion extracts the driver version from an NVIDIA library path
+func extractDriverVersion(libraryPath string) string {
+	// Extract version from paths like "/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.575.64.03"
+	versionPattern := regexp.MustCompile(`\.so\.(\d+\.\d+\.\d+)$`)
+	if matches := versionPattern.FindStringSubmatch(libraryPath); len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+// checkDriverCompatibility checks if the checkpoint and node driver versions are compatible
+func checkDriverCompatibility(ctx context.Context, checkpointPath, nodeDriverVersion string) {
+	checkpointVersion := extractDriverVersion(checkpointPath)
+	if checkpointVersion == "" || nodeDriverVersion == "" {
+		return // Skip if we can't determine versions
+	}
+
+	if checkpointVersion != nodeDriverVersion {
+		// Parse major version numbers for compatibility checking
+		checkpointMajor := strings.Split(checkpointVersion, ".")[0]
+		nodeMajor := strings.Split(nodeDriverVersion, ".")[0]
+
+		if checkpointMajor != nodeMajor {
+			log.Warnf(ctx, "NVIDIA driver major version mismatch: checkpoint=%s, node=%s - this may cause compatibility issues",
+				checkpointVersion, nodeDriverVersion)
+		} else {
+			log.Infof(ctx, "NVIDIA driver version change detected: checkpoint=%s, node=%s - compatibility should be maintained",
+				checkpointVersion, nodeDriverVersion)
+		}
+	}
+}
+
+// mapNVIDIAMountPath maps a checkpoint NVIDIA mount path to the corresponding path on the current node
+func mapNVIDIAMountPath(ctx context.Context, checkpointPath string, driverInfo *NVIDIADriverInfo) (string, bool) {
+	// Extract the base filename from the checkpoint path
+	filename := filepath.Base(checkpointPath)
+
+	// Try to map libraries first
+	if baseName := getBaseLibraryName(filename); baseName != "" {
+		if nodePath, exists := driverInfo.LibraryPaths[baseName]; exists {
+			log.Debugf(ctx, "Mapped NVIDIA library: %s -> %s", checkpointPath, nodePath)
+			return nodePath, true
+		}
+
+		// Try without version-specific matching for broader compatibility
+		basePattern := strings.TrimSuffix(baseName, ".so")
+		for libName, nodePath := range driverInfo.LibraryPaths {
+			if strings.HasPrefix(libName, basePattern) {
+				log.Debugf(ctx, "Mapped NVIDIA library (fuzzy): %s -> %s", checkpointPath, nodePath)
+				return nodePath, true
+			}
+		}
+	}
+
+	// Try to map binaries
+	if binName := filepath.Base(checkpointPath); strings.HasPrefix(binName, "nvidia-") {
+		if nodePath, exists := driverInfo.BinaryPaths[binName]; exists {
+			log.Debugf(ctx, "Mapped NVIDIA binary: %s -> %s", checkpointPath, nodePath)
+			return nodePath, true
+		}
+	}
+
+	// Check if the exact path exists on the current node (same driver version case)
+	if _, err := os.Stat(checkpointPath); err == nil {
+		log.Debugf(ctx, "NVIDIA path exists as-is on node: %s", checkpointPath)
+		return checkpointPath, true
+	}
+
+	log.Debugf(ctx, "Could not map NVIDIA path: %s", checkpointPath)
+	return "", false
 }
 
 // checkIfCheckpointOCIImage returns checks if the input refers to a checkpoint image.
@@ -252,11 +525,13 @@ func (s *Server) CRImportCheckpoint(
 	if config.RootfsImageRef != "" {
 		id, err := storage.ParseStorageImageIDFromOutOfProcessData(config.RootfsImageRef)
 		if err != nil {
-			return "", fmt.Errorf("invalid RootfsImageRef %q: %w", config.RootfsImageRef, err)
+			fmt.Printf("invalid RootfsImageRef %q: %v\n skipping\n", config.RootfsImageRef, err)
+			// return "", fmt.Errorf("invalid RootfsImageRef %q: %w", config.RootfsImageRef, err)
+		} else {
+			// This is not quite out-of-process consumption, but types.ContainerConfig is at least
+			// a cross-process API, and this value is correct in that API.
+			rootFSImage = id.IDStringForOutOfProcessConsumptionOnly()
 		}
-		// This is not quite out-of-process consumption, but types.ContainerConfig is at least
-		// a cross-process API, and this value is correct in that API.
-		rootFSImage = id.IDStringForOutOfProcessConsumptionOnly()
 	}
 
 	containerConfig := &types.ContainerConfig{
@@ -297,16 +572,16 @@ func (s *Server) CRImportCheckpoint(
 		}
 
 		if dumpSpec.Linux.Devices != nil {
-                	for _, d := range dumpSpec.Linux.Devices {
-                              	device := &types.Device{
-                                      	ContainerPath: d.Path,
-                                       	HostPath:      d.Path,
-                                       	Permissions:   "rw",
-                               	}
+			for _, d := range dumpSpec.Linux.Devices {
+				device := &types.Device{
+					ContainerPath: d.Path,
+					HostPath:      d.Path,
+					Permissions:   "rw",
+				}
 
-                               	containerConfig.Devices = append(containerConfig.Devices, device)
-                       	}
-               	}
+				containerConfig.Devices = append(containerConfig.Devices, device)
+			}
+		}
 	}
 
 	ignoreMounts := map[string]bool{
@@ -323,12 +598,29 @@ func (s *Server) CRImportCheckpoint(
 		"/run/.containerenv": true,
 	}
 
+	// Detect available NVIDIA drivers on the current node for mount mapping
+	nvidiaDriverInfo, err := detectNVIDIADrivers(ctx)
+	if err != nil {
+		log.Warnf(ctx, "Failed to detect NVIDIA drivers: %v", err)
+		nvidiaDriverInfo = &NVIDIADriverInfo{
+			LibraryPaths: make(map[string]string),
+			BinaryPaths:  make(map[string]string),
+		}
+	}
+
+	if len(nvidiaDriverInfo.LibraryPaths) > 0 || len(nvidiaDriverInfo.BinaryPaths) > 0 {
+		log.Infof(ctx, "Detected NVIDIA drivers on restore node - version: %s, libraries: %d, binaries: %d",
+			nvidiaDriverInfo.DriverVersion, len(nvidiaDriverInfo.LibraryPaths), len(nvidiaDriverInfo.BinaryPaths))
+	}
+
 	// It is necessary to ensure that all bind mounts in the checkpoint archive are defined
 	// in the create container requested coming in via the CRI. If this check would not
 	// be here it would be possible to create a checkpoint archive that mounts some random
 	// file/directory on the host with the user knowing as it will happen without specifying
 	// it in the container definition.
 	missingMount := []string{}
+	nvidiaAutoMounts := []spec.Mount{}
+	nvidiaMapping := make(map[string]string) // checkpoint path -> node path mapping
 
 	for _, m := range dumpSpec.Mounts {
 		// Following mounts are ignored as they might point to the
@@ -336,6 +628,57 @@ func (s *Server) CRImportCheckpoint(
 		// be setup to point to the new location.
 		if ignoreMounts[m.Destination] {
 			continue
+		}
+
+		// Check if this is an NVIDIA mount and handle it specially
+		if IsNVIDIAMount(m.Destination) {
+			log.Debugf(ctx, "Detected NVIDIA mount from checkpoint: %s -> %s", m.Source, m.Destination)
+
+			// Check driver compatibility before mapping
+			checkDriverCompatibility(ctx, m.Source, nvidiaDriverInfo.DriverVersion)
+
+			// Try to map the checkpoint NVIDIA path to the current node's equivalent
+			nodePath, mapped := mapNVIDIAMountPath(ctx, m.Source, nvidiaDriverInfo)
+			if !mapped {
+				// If mapping failed, check if the original path exists (same driver version case)
+				if _, err := os.Stat(m.Source); err == nil {
+					nodePath = m.Source
+					log.Debugf(ctx, "Using original NVIDIA path as-is: %s", m.Source)
+				} else {
+					log.Warnf(ctx, "Could not map NVIDIA mount %s to current node, skipping (error: %v)", m.Source, err)
+					continue
+				}
+			}
+
+			// Verify that the mapped source exists on the host
+			if stat, err := os.Stat(nodePath); err == nil {
+				log.Infof(ctx, "Successfully mapped NVIDIA mount: %s -> %s (host: %s)", m.Source, m.Destination, nodePath)
+
+				// Additional validation for bind mounts
+				if m.Type == "bind" || m.Type == "" { // Default type is bind
+					// Ensure source and destination types match (file vs directory)
+					if stat.IsDir() {
+						log.Debugf(ctx, "NVIDIA mount source %s is a directory", nodePath)
+					} else {
+						log.Debugf(ctx, "NVIDIA mount source %s is a file", nodePath)
+					}
+				}
+
+				// Create a modified mount with the mapped path
+				mappedMount := m
+				mappedMount.Source = nodePath
+				nvidiaAutoMounts = append(nvidiaAutoMounts, mappedMount)
+				nvidiaMapping[m.Source] = nodePath
+
+				// Create the mount and add it directly
+				nvidiaMount := createNVIDIAMount(mappedMount)
+				log.Debugf(ctx, "Auto-adding mapped NVIDIA mount: %#v", nvidiaMount)
+				containerConfig.Mounts = append(containerConfig.Mounts, nvidiaMount)
+				continue
+			} else {
+				log.Warnf(ctx, "Mapped NVIDIA mount source %s does not exist on host (error: %v), skipping", nodePath, err)
+				continue
+			}
 		}
 
 		mount := &types.Mount{
@@ -382,7 +725,7 @@ func (s *Server) CRImportCheckpoint(
 			// Add other known safe system paths here as needed
 			unsafeMounts = append(unsafeMounts, mount)
 		}
-		
+
 		if len(unsafeMounts) > 0 {
 			// return "", fmt.Errorf(
 			// 	"restoring %q expects following bind mounts defined (%s)",
@@ -391,6 +734,53 @@ func (s *Server) CRImportCheckpoint(
 			// )
 		} else {
 			log.Infof(ctx, "Skipped %d system mount paths during restore", len(missingMount))
+		}
+	}
+
+	// Log information about NVIDIA mounts that were auto-detected and mounted
+	if len(nvidiaAutoMounts) > 0 {
+		log.Infof(ctx, "Auto-detected and mounted %d NVIDIA paths during restore:", len(nvidiaAutoMounts))
+
+		successfulMounts := 0
+		for _, mount := range nvidiaAutoMounts {
+			if originalPath, wasMapped := func() (string, bool) {
+				for orig, mapped := range nvidiaMapping {
+					if mapped == mount.Source {
+						return orig, true
+					}
+				}
+				return "", false
+			}(); wasMapped {
+				log.Infof(ctx, "  ✅ NVIDIA mount (mapped): %s -> %s -> %s", originalPath, mount.Source, mount.Destination)
+				successfulMounts++
+			} else {
+				log.Infof(ctx, "  ✅ NVIDIA mount (direct): %s -> %s", mount.Source, mount.Destination)
+				successfulMounts++
+			}
+		}
+
+		// Log driver version information if available
+		if nvidiaDriverInfo.DriverVersion != "" {
+			log.Infof(ctx, "NVIDIA driver version on restore node: %s", nvidiaDriverInfo.DriverVersion)
+		}
+
+		// Log any unmapped paths for troubleshooting
+		if len(nvidiaMapping) > 0 {
+			log.Debugf(ctx, "NVIDIA path mappings applied:")
+			for orig, mapped := range nvidiaMapping {
+				log.Debugf(ctx, "  %s -> %s", orig, mapped)
+			}
+		}
+
+		// Provide guidance if some NVIDIA mounts failed
+		if successfulMounts < len(nvidiaAutoMounts) {
+			log.Warnf(ctx, "Some NVIDIA mounts could not be processed. Container may have reduced GPU functionality.")
+			log.Infof(ctx, "To troubleshoot NVIDIA mount issues:")
+			log.Infof(ctx, "  1. Verify NVIDIA drivers are installed on the restore node")
+			log.Infof(ctx, "  2. Check that NVIDIA libraries exist in standard locations")
+			log.Infof(ctx, "  3. Ensure driver versions are compatible between checkpoint and restore nodes")
+		} else {
+			log.Infof(ctx, "All NVIDIA mounts processed successfully - GPU functionality should be preserved")
 		}
 	}
 
