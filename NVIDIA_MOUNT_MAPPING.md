@@ -49,6 +49,9 @@ Maps checkpoint NVIDIA paths to restore node equivalents:
 /usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.575.64.03
   -> /usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.535.86.10
 
+/usr/lib/x86_64-linux-gnu/nvidia/xorg/libglxserver_nvidia.so.575.64.03
+  -> /usr/lib/x86_64-linux-gnu/nvidia/xorg/libglxserver_nvidia.so.535.86.10
+
 /usr/bin/nvidia-smi -> /usr/bin/nvidia-smi (direct)
 ```
 
@@ -124,6 +127,7 @@ INFO: All NVIDIA mounts processed successfully - GPU functionality should be pre
 - `libGLESv1_CM_nvidia.so.*`
 - `libGLESv2_nvidia.so.*`
 - `libGLX_nvidia.so.*`
+- `libglxserver_nvidia.so.*` (Xorg GLX server library)
 - `libcuda.so.*`
 - `libnvidia-*.so.*`
 - `libnvoptix.so.*`
