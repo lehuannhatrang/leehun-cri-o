@@ -553,26 +553,30 @@ var _ = t.Describe("ContainerRestore", func() {
 			maskedPaths := []string{existingPath, missingPath}
 
 			// When
-			validatedPaths := server.ValidateAndFilterMaskedPaths(ctx, maskedPaths)
+			validatedPaths, missingPaths := server.ValidateAndFilterMaskedPaths(ctx, maskedPaths)
 
-			// Then - only existing paths should be kept, missing ones filtered out
+			// Then - only existing paths should be kept, missing ones returned separately
 			Expect(validatedPaths).To(HaveLen(1))
 			Expect(validatedPaths).To(ContainElement(existingPath))
-			Expect(validatedPaths).ToNot(ContainElement(missingPath))
+			Expect(missingPaths).To(HaveLen(1))
+			Expect(missingPaths).To(ContainElement(missingPath))
 		})
 
-		It("should return empty list when all maskedPaths are missing", func() {
+		It("should return empty lists when all maskedPaths are missing", func() {
 			// Given
 			ctx := context.Background()
 			missingPath1 := "/proc/non_existent_path_for_test_1"
 			missingPath2 := "/proc/non_existent_path_for_test_2"
-			maskedPaths := []string{missingPath1, missingPath2}
+			maskedPathsList := []string{missingPath1, missingPath2}
 
 			// When
-			validatedPaths := server.ValidateAndFilterMaskedPaths(ctx, maskedPaths)
+			validatedPaths, missingPaths := server.ValidateAndFilterMaskedPaths(ctx, maskedPathsList)
 
 			// Then
 			Expect(validatedPaths).To(HaveLen(0))
+			Expect(missingPaths).To(HaveLen(2))
+			Expect(missingPaths).To(ContainElement(missingPath1))
+			Expect(missingPaths).To(ContainElement(missingPath2))
 		})
 	})
 })
