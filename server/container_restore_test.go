@@ -545,7 +545,7 @@ var _ = t.Describe("ContainerRestore", func() {
 	})
 
 	t.Describe("MaskedPaths validation", func() {
-		It("should handle missing maskedPaths during restore", func() {
+		It("should filter out missing maskedPaths during restore", func() {
 			// Given
 			ctx := context.Background()
 			existingPath := "/proc/acpi" // This should exist on most systems
@@ -553,29 +553,26 @@ var _ = t.Describe("ContainerRestore", func() {
 			maskedPaths := []string{existingPath, missingPath}
 
 			// When
-			validatedPaths := server.ValidateAndFixMaskedPaths(ctx, maskedPaths)
+			validatedPaths := server.ValidateAndFilterMaskedPaths(ctx, maskedPaths)
 
-			// Then - all paths should be kept (missing ones will be handled with /dev/null mounts)
-			Expect(validatedPaths).To(HaveLen(2))
+			// Then - only existing paths should be kept, missing ones filtered out
+			Expect(validatedPaths).To(HaveLen(1))
 			Expect(validatedPaths).To(ContainElement(existingPath))
-			Expect(validatedPaths).To(ContainElement(missingPath))
+			Expect(validatedPaths).ToNot(ContainElement(missingPath))
 		})
 
-		It("should create /dev/null mounts for missing maskedPaths", func() {
+		It("should return empty list when all maskedPaths are missing", func() {
 			// Given
 			ctx := context.Background()
-			missingPath := "/proc/non_existent_path_for_test"
-			maskedPaths := []string{missingPath}
-			var mounts []*types.Mount
+			missingPath1 := "/proc/non_existent_path_for_test_1"
+			missingPath2 := "/proc/non_existent_path_for_test_2"
+			maskedPaths := []string{missingPath1, missingPath2}
 
 			// When
-			server.CreateDevNullMountsForMaskedPaths(ctx, maskedPaths, &mounts)
+			validatedPaths := server.ValidateAndFilterMaskedPaths(ctx, maskedPaths)
 
 			// Then
-			Expect(mounts).To(HaveLen(1))
-			Expect(mounts[0].ContainerPath).To(Equal(missingPath))
-			Expect(mounts[0].HostPath).To(Equal("/dev/null"))
-			Expect(mounts[0].Readonly).To(BeTrue())
+			Expect(validatedPaths).To(HaveLen(0))
 		})
 	})
 })

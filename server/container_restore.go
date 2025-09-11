@@ -345,8 +345,8 @@ func checkDriverCompatibility(ctx context.Context, checkpointPath, nodeDriverVer
 	}
 }
 
-// ValidateAndFixMaskedPaths validates maskedPaths from checkpoint and creates /dev/null mounts for missing paths
-func ValidateAndFixMaskedPaths(ctx context.Context, maskedPaths []string) []string {
+// ValidateAndFilterMaskedPaths validates maskedPaths from checkpoint and filters out missing paths
+func ValidateAndFilterMaskedPaths(ctx context.Context, maskedPaths []string) []string {
 	if len(maskedPaths) == 0 {
 		return maskedPaths
 	}
@@ -357,10 +357,9 @@ func ValidateAndFixMaskedPaths(ctx context.Context, maskedPaths []string) []stri
 	for _, path := range maskedPaths {
 		if _, err := os.Stat(path); err != nil {
 			if os.IsNotExist(err) {
-				log.Debugf(ctx, "MaskedPath %s does not exist on restore node, will mount /dev/null", path)
+				log.Debugf(ctx, "MaskedPath %s does not exist on restore node, removing from maskedPaths list", path)
 				missingPaths = append(missingPaths, path)
-				// Still add the path - we'll handle the /dev/null mount later
-				validatedPaths = append(validatedPaths, path)
+				// Do NOT add missing paths to validatedPaths - they will be filtered out
 			} else {
 				log.Warnf(ctx, "Failed to check maskedPath %s: %v, keeping in list", path, err)
 				validatedPaths = append(validatedPaths, path)
@@ -372,38 +371,12 @@ func ValidateAndFixMaskedPaths(ctx context.Context, maskedPaths []string) []stri
 	}
 
 	if len(missingPaths) > 0 {
-		log.Infof(ctx, "Found %d missing maskedPaths on restore node: %v", len(missingPaths), missingPaths)
-		log.Infof(ctx, "These paths will be mounted with /dev/null to maintain container security")
+		log.Infof(ctx, "Filtered out %d missing maskedPaths on restore node: %v", len(missingPaths), missingPaths)
+		log.Infof(ctx, "These paths don't exist on the restore node and don't need to be masked")
 	}
 
+	log.Infof(ctx, "Using %d validated maskedPaths for restore: %v", len(validatedPaths), validatedPaths)
 	return validatedPaths
-}
-
-// CreateDevNullMountsForMaskedPaths creates /dev/null bind mounts for missing maskedPaths
-func CreateDevNullMountsForMaskedPaths(ctx context.Context, maskedPaths []string, mounts *[]*types.Mount) {
-	if len(maskedPaths) == 0 {
-		return
-	}
-
-	devNullMounts := 0
-	for _, path := range maskedPaths {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			// Create a /dev/null bind mount for this missing masked path
-			devNullMount := &types.Mount{
-				ContainerPath: path,
-				HostPath:      "/dev/null",
-				Readonly:      true,
-				Propagation:   types.MountPropagation_PROPAGATION_PRIVATE,
-			}
-			*mounts = append(*mounts, devNullMount)
-			devNullMounts++
-			log.Debugf(ctx, "Added /dev/null mount for missing maskedPath: %s", path)
-		}
-	}
-
-	if devNullMounts > 0 {
-		log.Infof(ctx, "Created %d /dev/null bind mounts for missing maskedPaths during restore", devNullMounts)
-	}
 }
 
 // mapNVIDIAMountPath maps a checkpoint NVIDIA mount path to the corresponding path on the current node
@@ -709,8 +682,8 @@ func (s *Server) CRImportCheckpoint(
 
 	if dumpSpec.Linux != nil {
 		if dumpSpec.Linux.MaskedPaths != nil {
-			// Validate maskedPaths and handle missing paths on restore node
-			validatedMaskedPaths := ValidateAndFixMaskedPaths(ctx, dumpSpec.Linux.MaskedPaths)
+			// Validate maskedPaths and filter out missing paths on restore node
+			validatedMaskedPaths := ValidateAndFilterMaskedPaths(ctx, dumpSpec.Linux.MaskedPaths)
 			containerConfig.Linux.SecurityContext.MaskedPaths = validatedMaskedPaths
 		}
 
@@ -858,11 +831,6 @@ func (s *Server) CRImportCheckpoint(
 
 		log.Debugf(ctx, "Adding mounts %#v", mount)
 		containerConfig.Mounts = append(containerConfig.Mounts, mount)
-	}
-
-	// Create /dev/null bind mounts for missing maskedPaths
-	if dumpSpec.Linux != nil && dumpSpec.Linux.MaskedPaths != nil {
-		CreateDevNullMountsForMaskedPaths(ctx, dumpSpec.Linux.MaskedPaths, &containerConfig.Mounts)
 	}
 
 	if len(missingMount) > 0 {
