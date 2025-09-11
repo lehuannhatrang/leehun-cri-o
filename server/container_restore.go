@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
+	"github.com/checkpoint-restore/go-criu/v7/stats"
 	"github.com/containers/storage/pkg/archive"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -386,11 +387,20 @@ func CreateLocalCheckpointCopy(ctx context.Context, sourceDir, containerID strin
 
 	log.Debugf(ctx, "Created temporary checkpoint directory: %s", tempDir)
 
-	// List of checkpoint files to copy
+	// List of checkpoint files to copy - include all files needed for CRIU restore
 	checkpointFiles := []string{
-		metadata.SpecDumpFile,
-		metadata.ConfigDumpFile,
-		metadata.CheckpointDirectory,
+		metadata.SpecDumpFile,        // spec.dump
+		metadata.ConfigDumpFile,      // config.dump
+		metadata.CheckpointDirectory, // checkpoint/ (contains inventory.img, mountpoints-*.img, etc.)
+		"artifacts",                  // CRIU artifacts
+		metadata.DevShmCheckpointTar, // dev-shm checkpoint tar
+		metadata.RootFsDiffTar,       // rootfs diff tar
+		metadata.DeletedFilesFile,    // deleted files info
+		metadata.PodOptionsFile,      // pod options
+		metadata.PodDumpFile,         // pod dump
+		stats.StatsDump,              // stats dump
+		"bind.mounts",                // bind mounts info
+		annotations.LogPath,          // log path
 	}
 
 	for _, fileName := range checkpointFiles {
@@ -409,6 +419,36 @@ func CreateLocalCheckpointCopy(ctx context.Context, sourceDir, containerID strin
 			// Don't fail completely, some files might be optional
 		} else {
 			log.Debugf(ctx, "Copied checkpoint file: %s -> %s", srcPath, dstPath)
+		}
+	}
+
+	// Also copy any additional files that might be present in the source directory
+	// This ensures we don't miss any checkpoint-related files
+	if entries, err := os.ReadDir(sourceDir); err == nil {
+		for _, entry := range entries {
+			fileName := entry.Name()
+
+			// Skip files we already copied
+			alreadyCopied := false
+			for _, copiedFile := range checkpointFiles {
+				if fileName == copiedFile {
+					alreadyCopied = true
+					break
+				}
+			}
+			if alreadyCopied {
+				continue
+			}
+
+			// Copy additional files that might be checkpoint-related
+			srcPath := filepath.Join(sourceDir, fileName)
+			dstPath := filepath.Join(tempDir, fileName)
+
+			if err := copyFileOrDir(srcPath, dstPath); err != nil {
+				log.Debugf(ctx, "Failed to copy additional checkpoint file %s: %v", fileName, err)
+			} else {
+				log.Debugf(ctx, "Copied additional checkpoint file: %s -> %s", srcPath, dstPath)
+			}
 		}
 	}
 
