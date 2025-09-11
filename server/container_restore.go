@@ -1216,10 +1216,9 @@ func (s *Server) CRImportCheckpoint(
 		}
 	}()
 
-	// If we created a local checkpoint copy, we need to ensure the cleaned files
-	// get copied to the container directory for CRIU to use
+	// If we created a local checkpoint copy, create symbolic links to point CRIU to our cleaned files
 	if localCheckpointDir != "" {
-		log.Infof(ctx, "Copying cleaned checkpoint files to container directory for CRIU restore")
+		log.Infof(ctx, "Linking cleaned checkpoint files for CRIU restore")
 
 		// The checkpoint path that CRIU will use
 		containerCheckpointPath := newContainer.CheckpointPath()
@@ -1230,19 +1229,19 @@ func (s *Server) CRImportCheckpoint(
 			log.Warnf(ctx, "Failed to remove existing checkpoint directory %s: %v", containerCheckpointPath, err)
 		}
 
-		// Copy the cleaned checkpoint directory to where CRIU expects it
+		// Create symbolic link from container checkpoint path to our cleaned checkpoint directory
 		cleanedCheckpointDir := filepath.Join(localCheckpointDir, metadata.CheckpointDirectory)
 		if _, err := os.Stat(cleanedCheckpointDir); err == nil {
-			if err := copyFileOrDir(cleanedCheckpointDir, containerCheckpointPath); err != nil {
-				log.Errorf(ctx, "Failed to copy cleaned checkpoint directory: %v", err)
-				return "", fmt.Errorf("failed to copy cleaned checkpoint directory: %w", err)
+			if err := os.Symlink(cleanedCheckpointDir, containerCheckpointPath); err != nil {
+				log.Errorf(ctx, "Failed to create symbolic link for cleaned checkpoint directory: %v", err)
+				return "", fmt.Errorf("failed to create symbolic link for cleaned checkpoint directory: %w", err)
 			}
-			log.Infof(ctx, "Copied cleaned checkpoint directory: %s -> %s", cleanedCheckpointDir, containerCheckpointPath)
+			log.Infof(ctx, "Created symbolic link for cleaned checkpoint directory: %s -> %s", containerCheckpointPath, cleanedCheckpointDir)
 		} else {
 			log.Warnf(ctx, "Cleaned checkpoint directory %s does not exist: %v", cleanedCheckpointDir, err)
 		}
 
-		// Also copy the cleaned spec.dump to the container directory
+		// Also create symbolic link for the cleaned spec.dump
 		cleanedSpecDump := filepath.Join(localCheckpointDir, metadata.SpecDumpFile)
 		containerSpecDump := filepath.Join(newContainer.Dir(), metadata.SpecDumpFile)
 		if _, err := os.Stat(cleanedSpecDump); err == nil {
@@ -1251,11 +1250,11 @@ func (s *Server) CRImportCheckpoint(
 				log.Warnf(ctx, "Failed to remove existing %s: %v", containerSpecDump, err)
 			}
 
-			if err := copyFile(cleanedSpecDump, containerSpecDump); err != nil {
-				log.Errorf(ctx, "Failed to copy cleaned spec.dump: %v", err)
-				return "", fmt.Errorf("failed to copy cleaned spec.dump: %w", err)
+			if err := os.Symlink(cleanedSpecDump, containerSpecDump); err != nil {
+				log.Errorf(ctx, "Failed to create symbolic link for cleaned spec.dump: %v", err)
+				return "", fmt.Errorf("failed to create symbolic link for cleaned spec.dump: %w", err)
 			}
-			log.Debugf(ctx, "Copied cleaned spec.dump: %s -> %s", cleanedSpecDump, containerSpecDump)
+			log.Debugf(ctx, "Created symbolic link for cleaned spec.dump: %s -> %s", containerSpecDump, cleanedSpecDump)
 		}
 	}
 
