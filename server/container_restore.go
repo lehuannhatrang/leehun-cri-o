@@ -1024,11 +1024,6 @@ func (s *Server) CRImportCheckpoint(
 		}
 	}
 
-	if len(nvidiaDriverInfo.LibraryPaths) > 0 || len(nvidiaDriverInfo.BinaryPaths) > 0 {
-		log.Infof(ctx, "Detected NVIDIA drivers on restore node - version: %s, libraries: %d, binaries: %d",
-			nvidiaDriverInfo.DriverVersion, len(nvidiaDriverInfo.LibraryPaths), len(nvidiaDriverInfo.BinaryPaths))
-	}
-
 	// It is necessary to ensure that all bind mounts in the checkpoint archive are defined
 	// in the create container requested coming in via the CRI. If this check would not
 	// be here it would be possible to create a checkpoint archive that mounts some random
@@ -1068,8 +1063,6 @@ func (s *Server) CRImportCheckpoint(
 
 			// Verify that the mapped source exists on the host
 			if stat, err := os.Stat(nodePath); err == nil {
-				log.Infof(ctx, "Successfully mapped NVIDIA mount: %s -> %s (host: %s)", m.Source, m.Destination, nodePath)
-
 				// Additional validation for bind mounts
 				if m.Type == "bind" || m.Type == "" { // Default type is bind
 					// Ensure source and destination types match (file vs directory)
@@ -1155,11 +1148,9 @@ func (s *Server) CRImportCheckpoint(
 
 	// Log information about NVIDIA mounts that were auto-detected and mounted
 	if len(nvidiaAutoMounts) > 0 {
-		log.Infof(ctx, "Auto-detected and mounted %d NVIDIA paths during restore:", len(nvidiaAutoMounts))
-
 		successfulMounts := 0
 		for _, mount := range nvidiaAutoMounts {
-			if originalPath, wasMapped := func() (string, bool) {
+			if _, wasMapped := func() (string, bool) {
 				for orig, mapped := range nvidiaMapping {
 					if mapped == mount.Source {
 						return orig, true
@@ -1167,17 +1158,10 @@ func (s *Server) CRImportCheckpoint(
 				}
 				return "", false
 			}(); wasMapped {
-				log.Infof(ctx, "  ✅ NVIDIA mount (mapped): %s -> %s -> %s", originalPath, mount.Source, mount.Destination)
 				successfulMounts++
 			} else {
-				log.Infof(ctx, "  ✅ NVIDIA mount (direct): %s -> %s", mount.Source, mount.Destination)
 				successfulMounts++
 			}
-		}
-
-		// Log driver version information if available
-		if nvidiaDriverInfo.DriverVersion != "" {
-			log.Infof(ctx, "NVIDIA driver version on restore node: %s", nvidiaDriverInfo.DriverVersion)
 		}
 
 		// Log any unmapped paths for troubleshooting
@@ -1186,17 +1170,6 @@ func (s *Server) CRImportCheckpoint(
 			for orig, mapped := range nvidiaMapping {
 				log.Debugf(ctx, "  %s -> %s", orig, mapped)
 			}
-		}
-
-		// Provide guidance if some NVIDIA mounts failed
-		if successfulMounts < len(nvidiaAutoMounts) {
-			log.Warnf(ctx, "Some NVIDIA mounts could not be processed. Container may have reduced GPU functionality.")
-			log.Infof(ctx, "To troubleshoot NVIDIA mount issues:")
-			log.Infof(ctx, "  1. Verify NVIDIA drivers are installed on the restore node")
-			log.Infof(ctx, "  2. Check that NVIDIA libraries exist in standard locations")
-			log.Infof(ctx, "  3. Ensure driver versions are compatible between checkpoint and restore nodes")
-		} else {
-			log.Infof(ctx, "All NVIDIA mounts processed successfully - GPU functionality should be preserved")
 		}
 	}
 
@@ -1258,8 +1231,6 @@ func (s *Server) CRImportCheckpoint(
 
 	// If we created a local checkpoint copy, create symbolic links to point CRIU to our cleaned files
 	if localCheckpointDir != "" {
-		log.Infof(ctx, "Linking cleaned checkpoint files for CRIU restore")
-
 		// The checkpoint path that CRIU will use
 		containerCheckpointPath := newContainer.CheckpointPath()
 		log.Debugf(ctx, "Container checkpoint path: %s", containerCheckpointPath)
