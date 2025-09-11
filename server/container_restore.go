@@ -1221,32 +1221,41 @@ func (s *Server) CRImportCheckpoint(
 	if localCheckpointDir != "" {
 		log.Infof(ctx, "Copying cleaned checkpoint files to container directory for CRIU restore")
 
-		// Copy the cleaned checkpoint files to the container's directory
-		checkpointFilesToCopy := []string{
-			metadata.SpecDumpFile,
-			metadata.CheckpointDirectory,
+		// The checkpoint path that CRIU will use
+		containerCheckpointPath := newContainer.CheckpointPath()
+		log.Debugf(ctx, "Container checkpoint path: %s", containerCheckpointPath)
+
+		// Remove existing checkpoint directory first
+		if err := os.RemoveAll(containerCheckpointPath); err != nil {
+			log.Warnf(ctx, "Failed to remove existing checkpoint directory %s: %v", containerCheckpointPath, err)
 		}
 
-		for _, fileName := range checkpointFilesToCopy {
-			srcPath := filepath.Join(localCheckpointDir, fileName)
-			dstPath := filepath.Join(newContainer.Dir(), fileName)
-
-			if _, err := os.Stat(srcPath); err == nil {
-				// Remove existing file/directory first
-				if err := os.RemoveAll(dstPath); err != nil {
-					log.Warnf(ctx, "Failed to remove existing %s: %v", dstPath, err)
-				}
-
-				// Copy the cleaned version
-				if err := copyFileOrDir(srcPath, dstPath); err != nil {
-					log.Errorf(ctx, "Failed to copy cleaned %s to container directory: %v", fileName, err)
-					return "", fmt.Errorf("failed to copy cleaned checkpoint files: %w", err)
-				}
-
-				log.Debugf(ctx, "Copied cleaned checkpoint file: %s -> %s", srcPath, dstPath)
-			} else {
-				log.Debugf(ctx, "Cleaned checkpoint file %s does not exist, skipping copy", srcPath)
+		// Copy the cleaned checkpoint directory to where CRIU expects it
+		cleanedCheckpointDir := filepath.Join(localCheckpointDir, metadata.CheckpointDirectory)
+		if _, err := os.Stat(cleanedCheckpointDir); err == nil {
+			if err := copyFileOrDir(cleanedCheckpointDir, containerCheckpointPath); err != nil {
+				log.Errorf(ctx, "Failed to copy cleaned checkpoint directory: %v", err)
+				return "", fmt.Errorf("failed to copy cleaned checkpoint directory: %w", err)
 			}
+			log.Infof(ctx, "Copied cleaned checkpoint directory: %s -> %s", cleanedCheckpointDir, containerCheckpointPath)
+		} else {
+			log.Warnf(ctx, "Cleaned checkpoint directory %s does not exist: %v", cleanedCheckpointDir, err)
+		}
+
+		// Also copy the cleaned spec.dump to the container directory
+		cleanedSpecDump := filepath.Join(localCheckpointDir, metadata.SpecDumpFile)
+		containerSpecDump := filepath.Join(newContainer.Dir(), metadata.SpecDumpFile)
+		if _, err := os.Stat(cleanedSpecDump); err == nil {
+			// Remove existing spec.dump first
+			if err := os.RemoveAll(containerSpecDump); err != nil {
+				log.Warnf(ctx, "Failed to remove existing %s: %v", containerSpecDump, err)
+			}
+
+			if err := copyFile(cleanedSpecDump, containerSpecDump); err != nil {
+				log.Errorf(ctx, "Failed to copy cleaned spec.dump: %v", err)
+				return "", fmt.Errorf("failed to copy cleaned spec.dump: %w", err)
+			}
+			log.Debugf(ctx, "Copied cleaned spec.dump: %s -> %s", cleanedSpecDump, containerSpecDump)
 		}
 	}
 
