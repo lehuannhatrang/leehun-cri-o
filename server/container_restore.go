@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -373,6 +374,116 @@ func ValidateAndFilterMaskedPaths(ctx context.Context, maskedPaths []string) (va
 
 	log.Infof(ctx, "Using %d validated maskedPaths for restore: %v", len(validPaths), validPaths)
 	return validPaths, missingPaths
+}
+
+// CreateLocalCheckpointCopy creates a writable local copy of checkpoint files for editing
+func CreateLocalCheckpointCopy(ctx context.Context, sourceDir, containerID string) (string, error) {
+	// Create temporary directory for local checkpoint copy
+	tempDir, err := os.MkdirTemp("", fmt.Sprintf("criu-checkpoint-%s-", containerID))
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	log.Debugf(ctx, "Created temporary checkpoint directory: %s", tempDir)
+
+	// List of checkpoint files to copy
+	checkpointFiles := []string{
+		metadata.SpecDumpFile,
+		metadata.ConfigDumpFile,
+		metadata.CheckpointDirectory,
+	}
+
+	for _, fileName := range checkpointFiles {
+		srcPath := filepath.Join(sourceDir, fileName)
+		dstPath := filepath.Join(tempDir, fileName)
+
+		// Check if source file/directory exists
+		if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+			log.Debugf(ctx, "Checkpoint file %s does not exist, skipping", fileName)
+			continue
+		}
+
+		// Copy file or directory
+		if err := copyFileOrDir(srcPath, dstPath); err != nil {
+			log.Warnf(ctx, "Failed to copy checkpoint file %s: %v", fileName, err)
+			// Don't fail completely, some files might be optional
+		} else {
+			log.Debugf(ctx, "Copied checkpoint file: %s -> %s", srcPath, dstPath)
+		}
+	}
+
+	return tempDir, nil
+}
+
+// copyFileOrDir copies a file or directory recursively
+func copyFileOrDir(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.IsDir() {
+		return copyDir(src, dst)
+	}
+	return copyFile(src, dst)
+}
+
+// copyFile copies a single file
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// Create destination directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+// copyDir copies a directory recursively
+func copyDir(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	// Create destination directory
+	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+		return err
+	}
+
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err := copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // CleanupCRIUCheckpointFiles removes problematic paths from CRIU checkpoint files
@@ -785,19 +896,53 @@ func (s *Server) CRImportCheckpoint(
 		}
 	}
 
-	if dumpSpec.Linux != nil {
-		if dumpSpec.Linux.MaskedPaths != nil {
-			// Validate maskedPaths and get missing paths for CRIU cleanup
-			validatedMaskedPaths, missingMaskedPaths := ValidateAndFilterMaskedPaths(ctx, dumpSpec.Linux.MaskedPaths)
-			containerConfig.Linux.SecurityContext.MaskedPaths = validatedMaskedPaths
+	// Handle maskedPaths validation and CRIU file cleanup
+	var localCheckpointDir string
+	if dumpSpec.Linux != nil && dumpSpec.Linux.MaskedPaths != nil {
+		// Validate maskedPaths and get missing paths for CRIU cleanup
+		validatedMaskedPaths, missingMaskedPaths := ValidateAndFilterMaskedPaths(ctx, dumpSpec.Linux.MaskedPaths)
+		containerConfig.Linux.SecurityContext.MaskedPaths = validatedMaskedPaths
+
+		// If we have missing paths, we need to create a local copy and clean it
+		if len(missingMaskedPaths) > 0 {
+			// Create local writable copy of checkpoint files
+			var err error
+			localCheckpointDir, err = CreateLocalCheckpointCopy(ctx, mountPoint, createConfig.GetMetadata().GetName())
+			if err != nil {
+				log.Errorf(ctx, "Failed to create local checkpoint copy: %v", err)
+				return "", fmt.Errorf("failed to create local checkpoint copy: %w", err)
+			}
+
+			// Ensure cleanup of temporary directory
+			defer func() {
+				if err := os.RemoveAll(localCheckpointDir); err != nil {
+					log.Warnf(ctx, "Failed to cleanup temporary checkpoint directory %s: %v", localCheckpointDir, err)
+				} else {
+					log.Debugf(ctx, "Cleaned up temporary checkpoint directory: %s", localCheckpointDir)
+				}
+			}()
 
 			// Clean up CRIU checkpoint files to remove missing paths
-			if err := CleanupCRIUCheckpointFiles(ctx, mountPoint, missingMaskedPaths); err != nil {
+			if err := CleanupCRIUCheckpointFiles(ctx, localCheckpointDir, missingMaskedPaths); err != nil {
 				log.Errorf(ctx, "Failed to clean CRIU checkpoint files: %v", err)
 				return "", fmt.Errorf("failed to clean CRIU checkpoint files: %w", err)
 			}
-		}
 
+			// Re-read the cleaned spec.dump for further processing
+			cleanedDumpSpec := new(spec.Spec)
+			if _, err := metadata.ReadJSONFile(cleanedDumpSpec, localCheckpointDir, metadata.SpecDumpFile); err != nil {
+				log.Warnf(ctx, "Failed to re-read cleaned spec.dump, using original: %v", err)
+			} else {
+				dumpSpec = cleanedDumpSpec
+				log.Debugf(ctx, "Using cleaned spec.dump for further processing")
+			}
+
+			// Update mountPoint to use our cleaned local copy for subsequent operations
+			mountPoint = localCheckpointDir
+		}
+	}
+
+	if dumpSpec.Linux != nil {
 		if dumpSpec.Linux.ReadonlyPaths != nil {
 			containerConfig.Linux.SecurityContext.ReadonlyPaths = dumpSpec.Linux.ReadonlyPaths
 		}
@@ -1070,6 +1215,40 @@ func (s *Server) CRImportCheckpoint(
 			s.removeContainer(ctx, newContainer)
 		}
 	}()
+
+	// If we created a local checkpoint copy, we need to ensure the cleaned files
+	// get copied to the container directory for CRIU to use
+	if localCheckpointDir != "" {
+		log.Infof(ctx, "Copying cleaned checkpoint files to container directory for CRIU restore")
+
+		// Copy the cleaned checkpoint files to the container's directory
+		checkpointFilesToCopy := []string{
+			metadata.SpecDumpFile,
+			metadata.CheckpointDirectory,
+		}
+
+		for _, fileName := range checkpointFilesToCopy {
+			srcPath := filepath.Join(localCheckpointDir, fileName)
+			dstPath := filepath.Join(newContainer.Dir(), fileName)
+
+			if _, err := os.Stat(srcPath); err == nil {
+				// Remove existing file/directory first
+				if err := os.RemoveAll(dstPath); err != nil {
+					log.Warnf(ctx, "Failed to remove existing %s: %v", dstPath, err)
+				}
+
+				// Copy the cleaned version
+				if err := copyFileOrDir(srcPath, dstPath); err != nil {
+					log.Errorf(ctx, "Failed to copy cleaned %s to container directory: %v", fileName, err)
+					return "", fmt.Errorf("failed to copy cleaned checkpoint files: %w", err)
+				}
+
+				log.Debugf(ctx, "Copied cleaned checkpoint file: %s -> %s", srcPath, dstPath)
+			} else {
+				log.Debugf(ctx, "Cleaned checkpoint file %s does not exist, skipping copy", srcPath)
+			}
+		}
+	}
 
 	if err := s.ContainerServer.CtrIDIndex().Add(ctr.ID()); err != nil {
 		return "", err
