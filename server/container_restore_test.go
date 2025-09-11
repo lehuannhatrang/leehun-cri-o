@@ -22,6 +22,7 @@ import (
 	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/cri-o/cri-o/internal/storage/references"
 	crioann "github.com/cri-o/cri-o/pkg/annotations"
+	"github.com/cri-o/cri-o/server"
 )
 
 var _ = t.Describe("ContainerRestore", func() {
@@ -540,6 +541,41 @@ var _ = t.Describe("ContainerRestore", func() {
 
 			// Then
 			Expect(err.Error()).To(ContainSubstring(`failed to read "spec.dump": open spec.dump: no such file or directory`))
+		})
+	})
+
+	t.Describe("MaskedPaths validation", func() {
+		It("should handle missing maskedPaths during restore", func() {
+			// Given
+			ctx := context.Background()
+			existingPath := "/proc/acpi" // This should exist on most systems
+			missingPath := "/proc/non_existent_path_for_test"
+			maskedPaths := []string{existingPath, missingPath}
+
+			// When
+			validatedPaths := server.ValidateAndFixMaskedPaths(ctx, maskedPaths)
+
+			// Then - all paths should be kept (missing ones will be handled with /dev/null mounts)
+			Expect(validatedPaths).To(HaveLen(2))
+			Expect(validatedPaths).To(ContainElement(existingPath))
+			Expect(validatedPaths).To(ContainElement(missingPath))
+		})
+
+		It("should create /dev/null mounts for missing maskedPaths", func() {
+			// Given
+			ctx := context.Background()
+			missingPath := "/proc/non_existent_path_for_test"
+			maskedPaths := []string{missingPath}
+			var mounts []*types.Mount
+
+			// When
+			server.CreateDevNullMountsForMaskedPaths(ctx, maskedPaths, &mounts)
+
+			// Then
+			Expect(mounts).To(HaveLen(1))
+			Expect(mounts[0].ContainerPath).To(Equal(missingPath))
+			Expect(mounts[0].HostPath).To(Equal("/dev/null"))
+			Expect(mounts[0].Readonly).To(BeTrue())
 		})
 	})
 })
