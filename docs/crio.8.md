@@ -88,11 +88,19 @@ crio
 [--namespaces-dir]=[value]
 [--no-pivot]
 [--nri-disable-connections]
+[--nri-enable-default-validator]
 [--nri-listen]=[value]
 [--nri-plugin-config-dir]=[value]
 [--nri-plugin-dir]=[value]
 [--nri-plugin-registration-timeout]=[value]
 [--nri-plugin-request-timeout]=[value]
+[--nri-validator-reject-custom-seccomp-adjustment]
+[--nri-validator-reject-namespace-adjustment]
+[--nri-validator-reject-oci-hook-adjustment]
+[--nri-validator-reject-runtime-default-seccomp-adjustment]
+[--nri-validator-reject-unconfined-seccomp-adjustment]
+[--nri-validator-required-plugins]=[value]
+[--nri-validator-tolerate-missing-plugins-annotation]=[value]
 [--oci-artifact-mount-support]
 [--pause-command]=[value]
 [--pause-image-auth-file]=[value]
@@ -115,6 +123,7 @@ crio
 [--selinux]
 [--separate-pull-cgroup]=[value]
 [--shared-cpuset]=[value]
+[--short-name-mode]=[value]
 [--signature-policy-dir]=[value]
 [--signature-policy]=[value]
 [--stats-collection-period]=[value]
@@ -356,6 +365,8 @@ crio [GLOBAL OPTIONS] command [COMMAND OPTIONS] [ARGUMENTS...]
 
 **--nri-disable-connections**: Disable connections from externally started NRI plugins.
 
+**--nri-enable-default-validator**: Enable the default NRI validator plugin.
+
 **--nri-listen**="": Socket to listen on for externally started NRI plugins to connect to. (default: "/var/run/nri/nri.sock")
 
 **--nri-plugin-config-dir**="": Directory to scan for configuration of pre-installed NRI plugins. (default: "/etc/nri/conf.d")
@@ -365,6 +376,20 @@ crio [GLOBAL OPTIONS] command [COMMAND OPTIONS] [ARGUMENTS...]
 **--nri-plugin-registration-timeout**="": Timeout for a plugin to register itself with NRI. (default: 5s)
 
 **--nri-plugin-request-timeout**="": Timeout for a plugin to handle an NRI request. (default: 2s)
+
+**--nri-validator-reject-custom-seccomp-adjustment**: Reject NRI plugin adjustment of custom seccomp policy.
+
+**--nri-validator-reject-namespace-adjustment**: Reject NRI plugin adjustment of linux namespaces.
+
+**--nri-validator-reject-oci-hook-adjustment**: Reject NRI plugin adjustment of OCI Hooks.
+
+**--nri-validator-reject-runtime-default-seccomp-adjustment**: Reject NRI plugin adjustment of runtime default seccomp policy.
+
+**--nri-validator-reject-unconfined-seccomp-adjustment**: Reject NRI plugin adjustment of unconfined seccomp policy.
+
+**--nri-validator-required-plugins**="": List of required NRI plugins that must be present.
+
+**--nri-validator-tolerate-missing-plugins-annotation**="": Name of the annotation used to indicate toleration of missing required NRI plugins.
 
 **--oci-artifact-mount-support**: If true, CRI-O can mount OCI artifacts as volumes.
 
@@ -409,6 +434,8 @@ crio [GLOBAL OPTIONS] command [COMMAND OPTIONS] [ARGUMENTS...]
 **--separate-pull-cgroup**="": [EXPERIMENTAL] Pull in new cgroup.
 
 **--shared-cpuset**="": CPUs set that will be used for guaranteed containers that want access to shared cpus
+
+**--short-name-mode**="": Describes the mode of short name resolution. Allowed values are 'enforcing' and 'disabled'. (default: "enforcing")
 
 **--signature-policy**="": Path to signature policy JSON file.
 

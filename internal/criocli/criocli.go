@@ -93,6 +93,10 @@ func mergeConfig(config *libconfig.Config, ctx *cli.Context) error {
 		config.GlobalAuthFile = ctx.String("global-auth-file")
 	}
 
+	if ctx.IsSet("namespaced-auth-dir") {
+		config.NamespacedAuthDir = ctx.String("namespaced-auth-dir")
+	}
+
 	if ctx.IsSet("signature-policy") {
 		config.SignaturePolicyPath = ctx.String("signature-policy")
 	}
@@ -509,6 +513,38 @@ func mergeConfig(config *libconfig.Config, ctx *cli.Context) error {
 		config.NRI.PluginRequestTimeout = ctx.Duration("nri-plugin-request-timeout")
 	}
 
+	if ctx.IsSet("nri-enable-default-validator") {
+		config.NRI.DefaultValidator.Enable = ctx.Bool("nri-enable-default-validator")
+	}
+
+	if ctx.IsSet("nri-validator-reject-oci-hook-adjustment") {
+		config.NRI.DefaultValidator.RejectOCIHookAdjustment = ctx.Bool("nri-validator-reject-oci-hook-adjustment")
+	}
+
+	if ctx.IsSet("nri-validator-reject-runtime-default-seccomp-adjustment") {
+		config.NRI.DefaultValidator.RejectRuntimeDefaultSeccompAdjustment = ctx.Bool("nri-validator-reject-runtime-default-seccomp-adjustment")
+	}
+
+	if ctx.IsSet("nri-validator-reject-unconfined-seccomp-adjustment") {
+		config.NRI.DefaultValidator.RejectUnconfinedSeccompAdjustment = ctx.Bool("nri-validator-reject-unconfined-seccomp-adjustment")
+	}
+
+	if ctx.IsSet("nri-validator-reject-custom-seccomp-adjustment") {
+		config.NRI.DefaultValidator.RejectCustomSeccompAdjustment = ctx.Bool("nri-validator-reject-custom-seccomp-adjustment")
+	}
+
+	if ctx.IsSet("nri-validator-reject-namespace-adjustment") {
+		config.NRI.DefaultValidator.RejectNamespaceAdjustment = ctx.Bool("nri-validator-reject-namespace-adjustment")
+	}
+
+	if ctx.IsSet("nri-validator-required-plugins") {
+		config.NRI.DefaultValidator.RequiredPlugins = StringSliceTrySplit(ctx, "nri-validator-required-plugins")
+	}
+
+	if ctx.IsSet("nri-validator-tolerate-missing-plugins-annotation") {
+		config.NRI.DefaultValidator.TolerateMissingAnnotation = ctx.String("nri-validator-tolerate-missing-plugins-annotation")
+	}
+
 	if ctx.IsSet("big-files-temporary-dir") {
 		config.BigFilesTemporaryDir = ctx.String("big-files-temporary-dir")
 	}
@@ -563,6 +599,10 @@ func mergeConfig(config *libconfig.Config, ctx *cli.Context) error {
 
 	if ctx.IsSet("timezone") {
 		config.Timezone = ctx.String("timezone")
+	}
+
+	if ctx.IsSet("short-name-mode") {
+		config.ShortNameMode = ctx.String("short-name-mode")
 	}
 
 	return nil
@@ -701,6 +741,14 @@ func getCrioFlags(defConf *libconfig.Config) []cli.Flag {
 			Usage:     "Path to a file like /var/lib/kubelet/config.json holding credentials necessary for pulling images from secure registries.",
 			EnvVars:   []string{"CONTAINER_GLOBAL_AUTH_FILE"},
 			TakesFile: true,
+		},
+		&cli.StringFlag{
+			Name:      "namespaced-auth-dir",
+			Usage:     "Path to the root directory for namespaced auth files. Must be an absolute path.",
+			Value:     defConf.NamespacedAuthDir,
+			EnvVars:   []string{"CONTAINER_NAMESPACED_AUTH_DIR"},
+			TakesFile: true,
+			Hidden:    true,
 		},
 		&cli.StringFlag{
 			Name:      "signature-policy",
@@ -1061,6 +1109,46 @@ func getCrioFlags(defConf *libconfig.Config) []cli.Flag {
 			Usage: `Timeout for a plugin to handle an NRI request.`,
 			Value: defConf.NRI.PluginRequestTimeout,
 		},
+		&cli.BoolFlag{
+			Name:  "nri-enable-default-validator",
+			Usage: "Enable the default NRI validator plugin.",
+			Value: defConf.NRI.DefaultValidator.Enable,
+		},
+		&cli.BoolFlag{
+			Name:  "nri-validator-reject-oci-hook-adjustment",
+			Usage: "Reject NRI plugin adjustment of OCI Hooks.",
+			Value: defConf.NRI.DefaultValidator.RejectOCIHookAdjustment,
+		},
+		&cli.BoolFlag{
+			Name:  "nri-validator-reject-runtime-default-seccomp-adjustment",
+			Usage: "Reject NRI plugin adjustment of runtime default seccomp policy.",
+			Value: defConf.NRI.DefaultValidator.RejectRuntimeDefaultSeccompAdjustment,
+		},
+		&cli.BoolFlag{
+			Name:  "nri-validator-reject-unconfined-seccomp-adjustment",
+			Usage: "Reject NRI plugin adjustment of unconfined seccomp policy.",
+			Value: defConf.NRI.DefaultValidator.RejectUnconfinedSeccompAdjustment,
+		},
+		&cli.BoolFlag{
+			Name:  "nri-validator-reject-custom-seccomp-adjustment",
+			Usage: "Reject NRI plugin adjustment of custom seccomp policy.",
+			Value: defConf.NRI.DefaultValidator.RejectCustomSeccompAdjustment,
+		},
+		&cli.BoolFlag{
+			Name:  "nri-validator-reject-namespace-adjustment",
+			Usage: "Reject NRI plugin adjustment of linux namespaces.",
+			Value: defConf.NRI.DefaultValidator.RejectNamespaceAdjustment,
+		},
+		&cli.StringSliceFlag{
+			Name:  "nri-validator-required-plugins",
+			Usage: "List of required NRI plugins that must be present.",
+			Value: cli.NewStringSlice(defConf.NRI.DefaultValidator.RequiredPlugins...),
+		},
+		&cli.StringFlag{
+			Name:  "nri-validator-tolerate-missing-plugins-annotation",
+			Usage: `Name of the annotation used to indicate toleration of missing required NRI plugins.`,
+			Value: defConf.NRI.DefaultValidator.TolerateMissingAnnotation,
+		},
 		&cli.StringFlag{
 			Name:    "big-files-temporary-dir",
 			Usage:   `Path to the temporary directory to use for storing big files, used to store image blobs and data streams related to containers image management.`,
@@ -1374,6 +1462,12 @@ func getCrioFlags(defConf *libconfig.Config) []cli.Flag {
 			Usage:   "To set the timezone for a container in CRI-O. If an empty string is provided, CRI-O retains its default behavior. Use 'Local' to match the timezone of the host machine.",
 			EnvVars: []string{"CONTAINER_TIME_ZONE"},
 			Value:   defConf.Timezone,
+		},
+		&cli.StringFlag{
+			Name:    "short-name-mode",
+			Usage:   "Describes the mode of short name resolution. Allowed values are 'enforcing' and 'disabled'.",
+			EnvVars: []string{"CONTAINER_SHORT_NAME_MODE"},
+			Value:   defConf.ShortNameMode,
 		},
 	}
 }
