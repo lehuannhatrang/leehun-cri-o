@@ -29,4 +29,10 @@ const (
 	// creating a checkpoint image to specify the version of CRIU used on the
 	// host where the checkpoint was created.
 	CheckpointAnnotationCriuVersion = "io.kubernetes.cri-o.annotations.checkpoint.criu.version"
+
+	// CheckpointAnnotationGPUDeviceMapping is used during restore to specify
+	// GPU device path mappings for GPU migration scenarios. Format is a JSON
+	// object mapping CDI device paths to checkpoint device paths, e.g.,
+	// {"/dev/nvidia0": "/dev/nvidia1"} means rename /dev/nvidia0 to /dev/nvidia1.
+	CheckpointAnnotationGPUDeviceMapping = "io.kubernetes.cri-o.annotations.checkpoint.gpu-device-mapping"
 )

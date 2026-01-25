@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
@@ -15,6 +16,7 @@ import (
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
 	kubetypes "k8s.io/kubelet/pkg/types"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 
 	"github.com/cri-o/cri-o/internal/factory/container"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
@@ -28,9 +30,8 @@ func IsNVIDIAMount(path string) bool {
 	// Check exact prefixes first
 	nvidiaPrefixes := []string{
 		"/usr/bin/nvidia-",
-		"/usr/lib/x86_64-linux-gnu/libEGL_nvidia.",
-		"/usr/lib/x86_64-linux-gnu/libGLESv1_CM_nvidia.",
-		"/usr/lib/x86_64-linux-gnu/libGLESv2_nvidia.",
+		"/usr/lib/x86_64-linux-gnu/libEGL",
+		"/usr/lib/x86_64-linux-gnu/libGLES",
 		"/usr/lib/x86_64-linux-gnu/libGLX_nvidia.",
 		"/usr/lib/x86_64-linux-gnu/libglxserver_nvidia.",
 		"/usr/lib/x86_64-linux-gnu/libcuda.",
@@ -38,6 +39,10 @@ func IsNVIDIAMount(path string) bool {
 		"/usr/lib/x86_64-linux-gnu/libnvcuvid.",
 		"/usr/lib/x86_64-linux-gnu/libnvidia-",
 		"/usr/lib/x86_64-linux-gnu/libnvoptix.",
+		"/usr/lib/x86_64-linux-gnu/libOpenGL.",
+		"/usr/lib/x86_64-linux-gnu/libOpenCL",
+		"/usr/lib/x86_64-linux-gnu/libGLX.",
+		"/usr/lib/x86_64-linux-gnu/libGL",
 		"/usr/lib/x86_64-linux-gnu/nvidia/",
 		"/usr/lib/x86_64-linux-gnu/nvidia/xorg/",
 		"/usr/lib/x86_64-linux-gnu/vdpau/libvdpau_nvidia.",
@@ -95,6 +100,89 @@ func IsNVIDIAMount(path string) bool {
 // This function is kept for backward compatibility but now uses IsNVIDIAMount
 func isNVIDIASystemPath(path string) bool {
 	return IsNVIDIAMount(path)
+}
+
+// isNVIDIAGPUDevice checks if a device path is an NVIDIA GPU device node
+// These devices should be managed by CDI when restoring to a different GPU
+func isNVIDIAGPUDevice(path string) bool {
+	// NVIDIA GPU device nodes that are GPU-specific and should be remapped via CDI
+	// /dev/nvidia0, /dev/nvidia1, etc. - specific GPU devices
+	// /dev/nvidiactl - NVIDIA control device
+	// /dev/nvidia-uvm - Unified Virtual Memory device
+	// /dev/nvidia-uvm-tools - UVM tools device
+	// /dev/nvidia-modeset - modeset device
+	// /dev/nvidia-caps/* - capability devices
+	return strings.HasPrefix(path, "/dev/nvidia")
+}
+
+// isNVIDIAGPUIndexDevice checks if a device path is a specific NVIDIA GPU index device
+// (e.g., /dev/nvidia0, /dev/nvidia1, etc.) as opposed to control devices like /dev/nvidiactl
+func isNVIDIAGPUIndexDevice(path string) bool {
+	if !strings.HasPrefix(path, "/dev/nvidia") {
+		return false
+	}
+	// Check if it's a numbered GPU device like /dev/nvidia0, /dev/nvidia1
+	suffix := strings.TrimPrefix(path, "/dev/nvidia")
+	if len(suffix) == 0 {
+		return false
+	}
+	// It should be a number (not -uvm, -modeset, ctl, -caps, etc.)
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveCDINVIDIAGPUDevices resolves CDI device references and extracts NVIDIA GPU device host paths
+// Returns a sorted list of NVIDIA GPU device host paths (e.g., ["/dev/nvidia0", "/dev/nvidia2"])
+func resolveCDINVIDIAGPUDevices(ctx context.Context, cdiDevices []*types.CDIDevice) []string {
+	if len(cdiDevices) == 0 {
+		return nil
+	}
+
+	// Refresh CDI registry to get latest specs
+	if err := cdi.Refresh(); err != nil {
+		log.Warnf(ctx, "CDI registry has errors during refresh: %v", err)
+	}
+
+	// Get the default CDI cache
+	cache := cdi.GetDefaultCache()
+	if cache == nil {
+		log.Warnf(ctx, "CDI cache not available")
+		return nil
+	}
+
+	var gpuDevicePaths []string
+
+	for _, cdiDev := range cdiDevices {
+		deviceName := cdiDev.GetName()
+		device := cache.GetDevice(deviceName)
+		if device == nil {
+			log.Debugf(ctx, "CDI device %s not found in registry", deviceName)
+			continue
+		}
+
+		// Get device nodes from the CDI device's container edits
+		for _, devNode := range device.ContainerEdits.DeviceNodes {
+			hostPath := devNode.HostPath
+			if hostPath == "" {
+				hostPath = devNode.Path // HostPath defaults to Path if not set
+			}
+
+			// Check if this is an NVIDIA GPU index device
+			if isNVIDIAGPUIndexDevice(hostPath) {
+				log.Infof(ctx, "Found NVIDIA GPU device from CDI: %s (container: %s, host: %s)",
+					deviceName, devNode.Path, hostPath)
+				gpuDevicePaths = append(gpuDevicePaths, hostPath)
+			}
+		}
+	}
+
+	// Sort the GPU device paths for consistent ordering
+	sort.Strings(gpuDevicePaths)
+	return gpuDevicePaths
 }
 
 // createNVIDIAMount creates an NVIDIA mount from the dumpSpec mount information
@@ -353,7 +441,6 @@ func mapNVIDIAMountPath(ctx context.Context, checkpointPath string, driverInfo *
 	// Try to map libraries first
 	if baseName := getBaseLibraryName(filename); baseName != "" {
 		if nodePath, exists := driverInfo.LibraryPaths[baseName]; exists {
-			log.Debugf(ctx, "Mapped NVIDIA library: %s -> %s", checkpointPath, nodePath)
 			return nodePath, true
 		}
 
@@ -361,7 +448,6 @@ func mapNVIDIAMountPath(ctx context.Context, checkpointPath string, driverInfo *
 		basePattern := strings.TrimSuffix(baseName, ".so")
 		for libName, nodePath := range driverInfo.LibraryPaths {
 			if strings.HasPrefix(libName, basePattern) {
-				log.Debugf(ctx, "Mapped NVIDIA library (fuzzy): %s -> %s", checkpointPath, nodePath)
 				return nodePath, true
 			}
 		}
@@ -646,6 +732,58 @@ func (s *Server) CRImportCheckpoint(
 		}
 	}
 
+	// Handle CDI devices from createConfig for GPU migration support
+	// The DRA driver (e.g., Nvidia DRA Driver) generates CDI specs that specify
+	// the correct GPU device to use for restore. This is critical for GPU migration
+	// where the checkpoint was on one GPU (e.g., /dev/nvidia1) but restore should
+	// use a different GPU (e.g., /dev/nvidia0).
+	cdiDevicesFromConfig := createConfig.GetCDIDevices()
+	hasCDIDevices := len(cdiDevicesFromConfig) > 0
+
+	// Resolve CDI device references to get the actual NVIDIA GPU device host paths
+	var cdiGPUHostPaths []string
+	if hasCDIDevices {
+		log.Infof(ctx, "CDI devices present for restore - resolving GPU device mappings")
+		for _, cdiDev := range cdiDevicesFromConfig {
+			log.Debugf(ctx, "CDI device: %s", cdiDev.GetName())
+		}
+		cdiGPUHostPaths = resolveCDINVIDIAGPUDevices(ctx, cdiDevicesFromConfig)
+		// Deduplicate GPU host paths
+		seen := make(map[string]bool)
+		var uniqueGPUPaths []string
+		for _, p := range cdiGPUHostPaths {
+			if !seen[p] {
+				seen[p] = true
+				uniqueGPUPaths = append(uniqueGPUPaths, p)
+			}
+		}
+		cdiGPUHostPaths = uniqueGPUPaths
+		if len(cdiGPUHostPaths) > 0 {
+			log.Infof(ctx, "Resolved %d unique NVIDIA GPU device(s) from CDI: %v", len(cdiGPUHostPaths), cdiGPUHostPaths)
+		}
+	}
+
+	// Pass through ALL CDI devices for injection - CDI also provides hooks, mounts,
+	// and environment variables that are essential for GPU functionality.
+	// Device path remapping is handled via annotation for post-CDI processing.
+	containerConfig.CDIDevices = cdiDevicesFromConfig
+
+	// Debug: Log dumpSpec.Linux state
+	if dumpSpec.Linux == nil {
+		log.Debugf(ctx, "dumpSpec.Linux is nil - no checkpoint Linux config")
+	} else {
+		log.Debugf(ctx, "dumpSpec.Linux is present")
+		if dumpSpec.Linux.Devices == nil {
+			log.Debugf(ctx, "dumpSpec.Linux.Devices is nil")
+		} else {
+			log.Infof(ctx, "dumpSpec.Linux.Devices has %d devices", len(dumpSpec.Linux.Devices))
+			for _, d := range dumpSpec.Linux.Devices {
+				log.Debugf(ctx, "Checkpoint device: path=%s, type=%s, major=%d, minor=%d",
+					d.Path, d.Type, d.Major, d.Minor)
+			}
+		}
+	}
+
 	if dumpSpec.Linux != nil {
 		if dumpSpec.Linux.MaskedPaths != nil {
 			containerConfig.Linux.SecurityContext.MaskedPaths = dumpSpec.Linux.MaskedPaths
@@ -655,17 +793,89 @@ func (s *Server) CRImportCheckpoint(
 			containerConfig.Linux.SecurityContext.ReadonlyPaths = dumpSpec.Linux.ReadonlyPaths
 		}
 
+		// Collect checkpoint GPU index devices for mapping
+		var checkpointGPUDevices []string
 		if dumpSpec.Linux.Devices != nil {
 			for _, d := range dumpSpec.Linux.Devices {
+				if isNVIDIAGPUIndexDevice(d.Path) {
+					checkpointGPUDevices = append(checkpointGPUDevices, d.Path)
+				}
+			}
+		}
+		sort.Strings(checkpointGPUDevices)
+		log.Infof(ctx, "Found %d checkpoint GPU index devices: %v", len(checkpointGPUDevices), checkpointGPUDevices)
+
+		// If no GPU devices found in dumpSpec.Linux.Devices, check mounts
+		if len(checkpointGPUDevices) == 0 && len(cdiGPUHostPaths) > 0 {
+			log.Infof(ctx, "No GPU devices in checkpoint spec, checking mounts...")
+			for _, m := range dumpSpec.Mounts {
+				if isNVIDIAGPUIndexDevice(m.Destination) {
+					checkpointGPUDevices = append(checkpointGPUDevices, m.Destination)
+					log.Infof(ctx, "Found checkpoint GPU from mount destination: %s", m.Destination)
+				}
+			}
+			sort.Strings(checkpointGPUDevices)
+		}
+
+		// Create GPU device rename mapping (CDI path -> checkpoint path)
+		// This mapping is used AFTER CDI injection to rename device paths.
+		// CDI creates /dev/nvidia0, we rename it to /dev/nvidia1 (what checkpoint expects)
+		// The minor number stays the same (from CDI), only the path changes.
+		gpuDeviceRenameMapping := make(map[string]string) // CDI path -> checkpoint path
+		if len(cdiGPUHostPaths) > 0 && len(checkpointGPUDevices) > 0 {
+			for i, cdiPath := range cdiGPUHostPaths {
+				if i < len(checkpointGPUDevices) {
+					checkpointPath := checkpointGPUDevices[i]
+					gpuDeviceRenameMapping[cdiPath] = checkpointPath
+					log.Infof(ctx, "GPU device rename mapping: CDI path %s -> checkpoint path %s",
+						cdiPath, checkpointPath)
+				}
+			}
+		}
+
+		// Store the GPU device rename mapping in annotation for post-CDI processing
+		// This mapping will be applied AFTER CDI injection to rename device paths
+		if len(gpuDeviceRenameMapping) > 0 {
+			mappingJSON, err := json.Marshal(gpuDeviceRenameMapping)
+			if err != nil {
+				log.Warnf(ctx, "Failed to marshal GPU device mapping: %v", err)
+			} else {
+				if containerConfig.Annotations == nil {
+					containerConfig.Annotations = make(map[string]string)
+				}
+				containerConfig.Annotations[annotations.CheckpointAnnotationGPUDeviceMapping] = string(mappingJSON)
+				log.Infof(ctx, "Stored GPU device rename mapping in annotation: %s", string(mappingJSON))
+			}
+		}
+
+		// Also add devices from checkpoint for non-GPU devices
+		// GPU devices will be created by CDI and renamed via annotation
+		if dumpSpec.Linux.Devices != nil {
+			for _, d := range dumpSpec.Linux.Devices {
+				// Skip NVIDIA GPU index devices - CDI will create them and we'll rename
+				if isNVIDIAGPUIndexDevice(d.Path) {
+					log.Debugf(ctx, "Skipping NVIDIA GPU device %s - will be created by CDI and renamed", d.Path)
+					continue
+				}
+				// Add non-GPU devices
 				device := &types.Device{
 					ContainerPath: d.Path,
 					HostPath:      d.Path,
 					Permissions:   "rw",
 				}
-
 				containerConfig.Devices = append(containerConfig.Devices, device)
 			}
 		}
+	}
+
+	// Debug: Log final device configuration
+	log.Infof(ctx, "Final containerConfig.Devices count: %d", len(containerConfig.Devices))
+	for _, d := range containerConfig.Devices {
+		log.Debugf(ctx, "  Device: ContainerPath=%s, HostPath=%s", d.GetContainerPath(), d.GetHostPath())
+	}
+	log.Infof(ctx, "Final containerConfig.CDIDevices count: %d", len(containerConfig.CDIDevices))
+	for _, d := range containerConfig.CDIDevices {
+		log.Debugf(ctx, "  CDI Device: %s", d.GetName())
 	}
 
 	ignoreMounts := map[string]bool{
@@ -736,8 +946,6 @@ func (s *Server) CRImportCheckpoint(
 
 			// Verify that the mapped source exists on the host
 			if stat, err := os.Stat(nodePath); err == nil {
-				log.Infof(ctx, "Successfully mapped NVIDIA mount: %s -> %s (host: %s)", m.Source, m.Destination, nodePath)
-
 				// Additional validation for bind mounts
 				if m.Type == "bind" || m.Type == "" { // Default type is bind
 					// Ensure source and destination types match (file vs directory)
@@ -756,7 +964,6 @@ func (s *Server) CRImportCheckpoint(
 
 				// Create the mount and add it directly
 				nvidiaMount := createNVIDIAMount(mappedMount)
-				log.Debugf(ctx, "Auto-adding mapped NVIDIA mount: %#v", nvidiaMount)
 				containerConfig.Mounts = append(containerConfig.Mounts, nvidiaMount)
 				continue
 			} else {
@@ -827,7 +1034,7 @@ func (s *Server) CRImportCheckpoint(
 
 		successfulMounts := 0
 		for _, mount := range nvidiaAutoMounts {
-			if originalPath, wasMapped := func() (string, bool) {
+			if _, wasMapped := func() (string, bool) {
 				for orig, mapped := range nvidiaMapping {
 					if mapped == mount.Source {
 						return orig, true
@@ -835,10 +1042,8 @@ func (s *Server) CRImportCheckpoint(
 				}
 				return "", false
 			}(); wasMapped {
-				log.Infof(ctx, "  ✅ NVIDIA mount (mapped): %s -> %s -> %s", originalPath, mount.Source, mount.Destination)
 				successfulMounts++
 			} else {
-				log.Infof(ctx, "  ✅ NVIDIA mount (direct): %s -> %s", mount.Source, mount.Destination)
 				successfulMounts++
 			}
 		}
@@ -849,12 +1054,12 @@ func (s *Server) CRImportCheckpoint(
 		}
 
 		// Log any unmapped paths for troubleshooting
-		if len(nvidiaMapping) > 0 {
-			log.Debugf(ctx, "NVIDIA path mappings applied:")
-			for orig, mapped := range nvidiaMapping {
-				log.Debugf(ctx, "  %s -> %s", orig, mapped)
-			}
-		}
+		// if len(nvidiaMapping) > 0 {
+		// 	log.Debugf(ctx, "NVIDIA path mappings applied:")
+		// 	for orig, mapped := range nvidiaMapping {
+		// 		log.Debugf(ctx, "  %s -> %s", orig, mapped)
+		// 	}
+		// }
 
 		// Provide guidance if some NVIDIA mounts failed
 		if successfulMounts < len(nvidiaAutoMounts) {

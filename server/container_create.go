@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1205,6 +1206,130 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
 		return nil, err
 	}
 
+	// Apply GPU device rename mapping for restore cases
+	// This renames CDI-created device paths to match what the checkpoint expects
+	if mappingJSON, ok := ctr.Config().GetAnnotations()[crioann.CheckpointAnnotationGPUDeviceMapping]; ok && mappingJSON != "" {
+		var gpuDeviceRenameMapping map[string]string
+		if err := json.Unmarshal([]byte(mappingJSON), &gpuDeviceRenameMapping); err != nil {
+			log.Warnf(ctx, "Failed to parse GPU device rename mapping: %v", err)
+		} else if len(gpuDeviceRenameMapping) > 0 {
+			log.Infof(ctx, "Applying GPU device rename mapping for restore: %v", gpuDeviceRenameMapping)
+			specgen := ctr.Spec()
+
+			// Debug: Log hooks after CDI injection
+			if specgen.Config.Hooks != nil {
+				log.Infof(ctx, "OCI spec hooks after CDI injection:")
+				for _, h := range specgen.Config.Hooks.Prestart {
+					log.Infof(ctx, "  Prestart hook: path=%s, args=%v", h.Path, h.Args)
+				}
+				for _, h := range specgen.Config.Hooks.CreateRuntime {
+					log.Infof(ctx, "  CreateRuntime hook: path=%s, args=%v", h.Path, h.Args)
+				}
+			}
+
+			// Debug: Log all devices after CDI injection
+			if specgen.Config.Linux != nil && specgen.Config.Linux.Devices != nil {
+				log.Infof(ctx, "OCI spec devices after CDI injection (%d devices):", len(specgen.Config.Linux.Devices))
+				for _, dev := range specgen.Config.Linux.Devices {
+					if strings.Contains(dev.Path, "nvidia") {
+						log.Infof(ctx, "  NVIDIA device: path=%s, major=%d, minor=%d", dev.Path, dev.Major, dev.Minor)
+					}
+				}
+			}
+
+			if specgen.Config.Linux != nil {
+				// Rename device paths in the OCI spec
+				for i, dev := range specgen.Config.Linux.Devices {
+					if newPath, ok := gpuDeviceRenameMapping[dev.Path]; ok {
+						log.Infof(ctx, "Renaming GPU device in OCI spec: %s -> %s (major=%d, minor=%d)",
+							dev.Path, newPath, dev.Major, dev.Minor)
+						specgen.Config.Linux.Devices[i].Path = newPath
+					}
+				}
+				// Also update device cgroup rules if present
+				if specgen.Config.Linux.Resources != nil {
+					for i, devCgroup := range specgen.Config.Linux.Resources.Devices {
+						// Device cgroup rules don't have paths, just major/minor
+						// Log for debugging
+						if devCgroup.Major != nil && devCgroup.Minor != nil {
+							log.Debugf(ctx, "Device cgroup rule: type=%s, major=%d, minor=%d, access=%s",
+								devCgroup.Type, *devCgroup.Major, *devCgroup.Minor, devCgroup.Access)
+						}
+						_ = i // Suppress unused variable warning
+					}
+				}
+
+				// Debug: Log devices AFTER rename
+				log.Infof(ctx, "OCI spec NVIDIA devices AFTER rename:")
+				for _, dev := range specgen.Config.Linux.Devices {
+					if strings.Contains(dev.Path, "nvidia") {
+						log.Infof(ctx, "  NVIDIA device: path=%s, major=%d, minor=%d", dev.Path, dev.Major, dev.Minor)
+					}
+				}
+			}
+
+			// CRITICAL: Remove CDI-related annotations to prevent nvidia-container-runtime
+			// from re-processing CDI and overwriting our device mapping.
+			// nvidia-container-runtime.cdi looks for these annotations and creates devices
+			// based on CDI specs, ignoring our renamed device paths.
+			if specgen.Config.Annotations != nil {
+				annotationsToRemove := []string{}
+				for key := range specgen.Config.Annotations {
+					// Remove CDI device annotations (cdi.k8s.io/*)
+					if strings.HasPrefix(key, "cdi.k8s.io") {
+						annotationsToRemove = append(annotationsToRemove, key)
+					}
+				}
+				for _, key := range annotationsToRemove {
+					log.Infof(ctx, "Removing CDI annotation to prevent nvidia-runtime re-processing: %s", key)
+					delete(specgen.Config.Annotations, key)
+				}
+			}
+
+			// CRITICAL: Fix NVIDIA_VISIBLE_DEVICES to prevent nvidia-container-runtime
+			// from re-injecting devices with wrong minor numbers.
+			// The checkpoint has NVIDIA_VISIBLE_DEVICES=all which causes nvidia-runtime
+			// to inject all GPUs, overriding our carefully configured devices.
+			// We need to remove duplicates and set it to the target GPU only.
+			if specgen.Config.Process != nil {
+				// Remove ALL existing NVIDIA_VISIBLE_DEVICES entries
+				newEnv := []string{}
+				for _, env := range specgen.Config.Process.Env {
+					if strings.HasPrefix(env, "NVIDIA_VISIBLE_DEVICES=") {
+						log.Infof(ctx, "Removing duplicate NVIDIA_VISIBLE_DEVICES: %s", env)
+						continue // Skip this entry
+					}
+					newEnv = append(newEnv, env)
+				}
+
+				// CRITICAL: Set NVIDIA_VISIBLE_DEVICES=void to prevent nvidia-container-runtime
+				// from creating its own device nodes. With "void", the nvidia runtime passes
+				// through to runc without modifying devices, so our renamed device paths
+				// (from CDI injection) will be used as-is.
+				//
+				// The CDI injection has already added the devices with correct major/minor
+				// numbers (e.g., /dev/nvidia0 with minor=0), and we've renamed them to
+				// match the checkpoint path (e.g., /dev/nvidia1). Setting NVIDIA_VISIBLE_DEVICES=void
+				// ensures the nvidia runtime doesn't override these with its own device creation.
+				//
+				// Note: CDI injection also adds all required library mounts and other env vars,
+				// so GPU functionality is preserved even with NVIDIA_VISIBLE_DEVICES=void.
+				newEnv = append(newEnv, "NVIDIA_VISIBLE_DEVICES=void")
+				specgen.Config.Process.Env = newEnv
+				log.Infof(ctx, "Set NVIDIA_VISIBLE_DEVICES=void to prevent nvidia-runtime device override")
+
+				// Log NVIDIA environment variables for debugging
+				for _, env := range specgen.Config.Process.Env {
+					if strings.HasPrefix(env, "NVIDIA_") {
+						log.Infof(ctx, "NVIDIA env var in spec: %s", env)
+					}
+				}
+			}
+
+			log.Infof(ctx, "GPU device rename complete - NVIDIA_VISIBLE_DEVICES set to target GPU, devices in linux.devices")
+		}
+	}
+
 	// Set up pids limit if pids cgroup is mounted
 	if node.CgroupHasPid() {
 		specgen.SetLinuxResourcesPidsLimit(s.config.PidsLimit)
@@ -1344,6 +1469,17 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
 			log.Warnf(ctx, "Failed to link container logs: %v", err)
 		}
 	}
+
+	// Debug: Log NVIDIA devices right before saving config.json
+	if specgen.Config.Linux != nil && specgen.Config.Linux.Devices != nil {
+		for _, dev := range specgen.Config.Linux.Devices {
+			if strings.Contains(dev.Path, "nvidia") {
+				log.Infof(ctx, "FINAL OCI spec before save - NVIDIA device: path=%s, major=%d, minor=%d",
+					dev.Path, dev.Major, dev.Minor)
+			}
+		}
+	}
+	log.Infof(ctx, "Saving config.json to %s", containerInfo.Dir)
 
 	saveOptions := generate.ExportOptions{}
 	if err := specgen.SaveToFile(filepath.Join(containerInfo.Dir, "config.json"), saveOptions); err != nil {
