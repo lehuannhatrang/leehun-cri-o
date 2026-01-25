@@ -1320,13 +1320,33 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
 
 				// Log NVIDIA environment variables for debugging
 				for _, env := range specgen.Config.Process.Env {
-					if strings.HasPrefix(env, "NVIDIA_") {
-						log.Infof(ctx, "NVIDIA env var in spec: %s", env)
+					if strings.HasPrefix(env, "NVIDIA_") || strings.HasPrefix(env, "CUDA_") {
+						log.Infof(ctx, "NVIDIA/CUDA env var in spec: %s", env)
 					}
 				}
 			}
 
 			log.Infof(ctx, "GPU device rename complete - NVIDIA_VISIBLE_DEVICES set to target GPU, devices in linux.devices")
+		}
+	}
+
+	// Add CUDA_DEVICE_MAP environment variable for GPU migration (requires NVIDIA driver 580+)
+	// This is used by the CRIU cuda plugin to pass --device-map to cuda-checkpoint
+	if cudaDeviceMap, ok := ctr.Config().GetAnnotations()[crioann.CheckpointAnnotationCUDADeviceMap]; ok && cudaDeviceMap != "" {
+		log.Infof(ctx, "Adding CUDA_DEVICE_MAP for GPU migration: %s", cudaDeviceMap)
+		specgen := ctr.Spec()
+		if specgen.Config.Process != nil {
+			// Remove any existing CUDA_DEVICE_MAP
+			newEnv := []string{}
+			for _, env := range specgen.Config.Process.Env {
+				if !strings.HasPrefix(env, "CUDA_DEVICE_MAP=") {
+					newEnv = append(newEnv, env)
+				}
+			}
+			// Add the CUDA_DEVICE_MAP from annotation
+			newEnv = append(newEnv, "CUDA_DEVICE_MAP="+cudaDeviceMap)
+			specgen.Config.Process.Env = newEnv
+			log.Infof(ctx, "Set CUDA_DEVICE_MAP=%s for CRIU cuda plugin", cudaDeviceMap)
 		}
 	}
 

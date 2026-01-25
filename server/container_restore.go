@@ -1,14 +1,17 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
@@ -183,6 +186,136 @@ func resolveCDINVIDIAGPUDevices(ctx context.Context, cdiDevices []*types.CDIDevi
 	// Sort the GPU device paths for consistent ordering
 	sort.Strings(gpuDevicePaths)
 	return gpuDevicePaths
+}
+
+// getGPUIndexFromDevicePath extracts the GPU index from a device path like /dev/nvidia0
+func getGPUIndexFromDevicePath(devicePath string) (int, error) {
+	if !isNVIDIAGPUIndexDevice(devicePath) {
+		return -1, fmt.Errorf("not a valid NVIDIA GPU index device: %s", devicePath)
+	}
+	suffix := strings.TrimPrefix(devicePath, "/dev/nvidia")
+	index, err := strconv.Atoi(suffix)
+	if err != nil {
+		return -1, fmt.Errorf("failed to parse GPU index from %s: %w", devicePath, err)
+	}
+	return index, nil
+}
+
+// getGPUUUIDs retrieves GPU UUIDs by running nvidia-smi
+// Returns a map of GPU index -> UUID (e.g., {0: "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"})
+func getGPUUUIDs(ctx context.Context) (map[int]string, error) {
+	// Run nvidia-smi to get GPU UUIDs
+	// nvidia-smi --query-gpu=index,uuid --format=csv,noheader
+	cmd := exec.Command("nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run nvidia-smi: %w", err)
+	}
+
+	uuids := make(map[int]string)
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// Format: "0, GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+		parts := strings.SplitN(line, ",", 2)
+		if len(parts) != 2 {
+			log.Warnf(ctx, "Unexpected nvidia-smi output format: %s", line)
+			continue
+		}
+		indexStr := strings.TrimSpace(parts[0])
+		uuid := strings.TrimSpace(parts[1])
+
+		index, err := strconv.Atoi(indexStr)
+		if err != nil {
+			log.Warnf(ctx, "Failed to parse GPU index: %s", indexStr)
+			continue
+		}
+		uuids[index] = uuid
+		log.Debugf(ctx, "Found GPU %d with UUID: %s", index, uuid)
+	}
+
+	if len(uuids) == 0 {
+		return nil, fmt.Errorf("no GPU UUIDs found from nvidia-smi")
+	}
+
+	return uuids, nil
+}
+
+// createCUDADeviceMap creates the CUDA_DEVICE_MAP environment variable value
+// for cuda-checkpoint --device-map option
+// Format: "GPU-oldUUID=GPU-newUUID" (for single GPU) or "GPU-old1=GPU-new1,GPU-old2=GPU-new2" (for multiple)
+// checkpointGPUPath is the GPU device from checkpoint (e.g., /dev/nvidia1)
+// targetGPUPath is the GPU device from CDI (e.g., /dev/nvidia0)
+func createCUDADeviceMap(ctx context.Context, checkpointGPUPaths, targetGPUPaths []string) (string, error) {
+	if len(checkpointGPUPaths) == 0 || len(targetGPUPaths) == 0 {
+		return "", fmt.Errorf("no GPU paths provided")
+	}
+
+	// Get all GPU UUIDs on this node
+	gpuUUIDs, err := getGPUUUIDs(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get GPU UUIDs: %w", err)
+	}
+
+	var mappings []string
+
+	// Create mapping for each checkpoint GPU to its corresponding target GPU
+	for i, checkpointPath := range checkpointGPUPaths {
+		if i >= len(targetGPUPaths) {
+			log.Warnf(ctx, "No target GPU for checkpoint GPU %s", checkpointPath)
+			break
+		}
+		targetPath := targetGPUPaths[i]
+
+		// Get GPU indices
+		checkpointIndex, err := getGPUIndexFromDevicePath(checkpointPath)
+		if err != nil {
+			log.Warnf(ctx, "Failed to get checkpoint GPU index: %v", err)
+			continue
+		}
+		targetIndex, err := getGPUIndexFromDevicePath(targetPath)
+		if err != nil {
+			log.Warnf(ctx, "Failed to get target GPU index: %v", err)
+			continue
+		}
+
+		// Get UUIDs for both indices
+		// Note: checkpointIndex refers to the original GPU, but we need its UUID from THIS node
+		// If the checkpoint was from a different node, we might not have that UUID
+		// For same-node restore to different GPU: we have both UUIDs
+		// For cross-node restore: we need to get checkpoint UUID from checkpoint metadata
+
+		// For now, assume same-node restore - both GPUs exist on this node
+		checkpointUUID, ok := gpuUUIDs[checkpointIndex]
+		if !ok {
+			log.Warnf(ctx, "No UUID found for checkpoint GPU index %d - assuming cross-node restore", checkpointIndex)
+			// For cross-node restore, we would need to get the UUID from checkpoint metadata
+			// For now, skip this mapping
+			continue
+		}
+
+		targetUUID, ok := gpuUUIDs[targetIndex]
+		if !ok {
+			return "", fmt.Errorf("no UUID found for target GPU index %d", targetIndex)
+		}
+
+		// Format: GPU-oldUUID=GPU-newUUID
+		mapping := fmt.Sprintf("%s=%s", checkpointUUID, targetUUID)
+		mappings = append(mappings, mapping)
+
+		log.Infof(ctx, "CUDA device map: GPU %d (%s) -> GPU %d (%s)",
+			checkpointIndex, checkpointUUID, targetIndex, targetUUID)
+	}
+
+	if len(mappings) == 0 {
+		return "", fmt.Errorf("no GPU UUID mappings created")
+	}
+
+	// Join multiple mappings with comma
+	return strings.Join(mappings, ","), nil
 }
 
 // createNVIDIAMount creates an NVIDIA mount from the dumpSpec mount information
@@ -845,6 +978,36 @@ func (s *Server) CRImportCheckpoint(
 				}
 				containerConfig.Annotations[annotations.CheckpointAnnotationGPUDeviceMapping] = string(mappingJSON)
 				log.Infof(ctx, "Stored GPU device rename mapping in annotation: %s", string(mappingJSON))
+			}
+		}
+
+		// Create CUDA device map for GPU migration (requires NVIDIA driver 580+)
+		// This creates a UUID-based mapping that will be passed to the CRIU cuda plugin
+		// via the CUDA_DEVICE_MAP environment variable for cuda-checkpoint --device-map
+		if len(cdiGPUHostPaths) > 0 && len(checkpointGPUDevices) > 0 {
+			// Only create mapping if checkpoint and target GPUs are different
+			needsMapping := false
+			for i, cdiPath := range cdiGPUHostPaths {
+				if i < len(checkpointGPUDevices) && cdiPath != checkpointGPUDevices[i] {
+					needsMapping = true
+					break
+				}
+			}
+
+			if needsMapping {
+				cudaDeviceMap, err := createCUDADeviceMap(ctx, checkpointGPUDevices, cdiGPUHostPaths)
+				if err != nil {
+					log.Warnf(ctx, "Failed to create CUDA device map (GPU migration may not work): %v", err)
+					log.Warnf(ctx, "Note: GPU migration requires NVIDIA driver 580+ and CUDA 13.0+")
+				} else {
+					if containerConfig.Annotations == nil {
+						containerConfig.Annotations = make(map[string]string)
+					}
+					containerConfig.Annotations[annotations.CheckpointAnnotationCUDADeviceMap] = cudaDeviceMap
+					log.Infof(ctx, "Stored CUDA device map in annotation for GPU migration: %s", cudaDeviceMap)
+				}
+			} else {
+				log.Infof(ctx, "Checkpoint and target GPUs are the same, no CUDA device map needed")
 			}
 		}
 

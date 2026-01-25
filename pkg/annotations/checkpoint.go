@@ -35,4 +35,12 @@ const (
 	// object mapping CDI device paths to checkpoint device paths, e.g.,
 	// {"/dev/nvidia0": "/dev/nvidia1"} means rename /dev/nvidia0 to /dev/nvidia1.
 	CheckpointAnnotationGPUDeviceMapping = "io.kubernetes.cri-o.annotations.checkpoint.gpu-device-mapping"
+
+	// CheckpointAnnotationCUDADeviceMap is used during restore to specify
+	// GPU UUID mappings for CUDA checkpoint/restore with GPU migration.
+	// This value is passed as the CUDA_DEVICE_MAP environment variable,
+	// which the CRIU cuda plugin uses to pass --device-map to cuda-checkpoint.
+	// Format: "GPU-<oldUUID>=GPU-<newUUID>" or comma-separated for multiple GPUs.
+	// Requires NVIDIA driver 580+ and CUDA 13.0+ for GPU migration support.
+	CheckpointAnnotationCUDADeviceMap = "io.kubernetes.cri-o.annotations.checkpoint.cuda-device-map"
 )
