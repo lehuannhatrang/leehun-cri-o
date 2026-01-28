@@ -28,9 +28,8 @@ func IsNVIDIAMount(path string) bool {
 	// Check exact prefixes first
 	nvidiaPrefixes := []string{
 		"/usr/bin/nvidia-",
-		"/usr/lib/x86_64-linux-gnu/libEGL_nvidia.",
-		"/usr/lib/x86_64-linux-gnu/libGLESv1_CM_nvidia.",
-		"/usr/lib/x86_64-linux-gnu/libGLESv2_nvidia.",
+		"/usr/lib/x86_64-linux-gnu/libEGL",
+		"/usr/lib/x86_64-linux-gnu/libGLES",
 		"/usr/lib/x86_64-linux-gnu/libGLX_nvidia.",
 		"/usr/lib/x86_64-linux-gnu/libglxserver_nvidia.",
 		"/usr/lib/x86_64-linux-gnu/libcuda.",
@@ -38,6 +37,10 @@ func IsNVIDIAMount(path string) bool {
 		"/usr/lib/x86_64-linux-gnu/libnvcuvid.",
 		"/usr/lib/x86_64-linux-gnu/libnvidia-",
 		"/usr/lib/x86_64-linux-gnu/libnvoptix.",
+		"/usr/lib/x86_64-linux-gnu/libOpenGL.",
+		"/usr/lib/x86_64-linux-gnu/libOpenCL",
+		"/usr/lib/x86_64-linux-gnu/libGLX.",
+		"/usr/lib/x86_64-linux-gnu/libGL",
 		"/usr/lib/x86_64-linux-gnu/nvidia/",
 		"/usr/lib/x86_64-linux-gnu/nvidia/xorg/",
 		"/usr/lib/x86_64-linux-gnu/vdpau/libvdpau_nvidia.",
