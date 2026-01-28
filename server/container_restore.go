@@ -26,6 +26,7 @@ import (
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/cri-o/cri-o/pkg/annotations"
+	"golang.org/x/sys/unix"
 )
 
 // IsNVIDIAMount checks if a mount path is an NVIDIA-related mount
@@ -247,8 +248,11 @@ func getGPUUUIDs(ctx context.Context) (map[int]string, error) {
 // createCUDADeviceMap creates the CUDA_DEVICE_MAP environment variable value
 // for cuda-checkpoint --device-map option
 // Format: "GPU-oldUUID=GPU-newUUID" (for single GPU) or "GPU-old1=GPU-new1,GPU-old2=GPU-new2" (for multiple)
-// checkpointGPUPath is the GPU device from checkpoint (e.g., /dev/nvidia1)
-// targetGPUPath is the GPU device from CDI (e.g., /dev/nvidia0)
+// createCUDADeviceMap creates a BIDIRECTIONAL GPU UUID mapping for cuda-checkpoint --device-map
+// cuda-checkpoint requires ALL GPUs to be mapped, even if the application doesn't use them.
+// Format: "GPU-old1=GPU-new1,GPU-new1=GPU-old1" for bidirectional mapping
+// checkpointGPUPaths: GPU devices from checkpoint (e.g., ["/dev/nvidia1"])
+// targetGPUPaths: GPU devices from CDI (e.g., ["/dev/nvidia0"])
 func createCUDADeviceMap(ctx context.Context, checkpointGPUPaths, targetGPUPaths []string) (string, error) {
 	if len(checkpointGPUPaths) == 0 || len(targetGPUPaths) == 0 {
 		return "", fmt.Errorf("no GPU paths provided")
@@ -260,9 +264,12 @@ func createCUDADeviceMap(ctx context.Context, checkpointGPUPaths, targetGPUPaths
 		return "", fmt.Errorf("failed to get GPU UUIDs: %w", err)
 	}
 
+	// Use a map to avoid duplicate mappings
+	mappingSet := make(map[string]bool)
 	var mappings []string
 
-	// Create mapping for each checkpoint GPU to its corresponding target GPU
+	// Create BIDIRECTIONAL mapping for each checkpoint GPU to its corresponding target GPU
+	// cuda-checkpoint requires: oldUUID=newUUID,newUUID=oldUUID for each pair
 	for i, checkpointPath := range checkpointGPUPaths {
 		if i >= len(targetGPUPaths) {
 			log.Warnf(ctx, "No target GPU for checkpoint GPU %s", checkpointPath)
@@ -282,18 +289,16 @@ func createCUDADeviceMap(ctx context.Context, checkpointGPUPaths, targetGPUPaths
 			continue
 		}
 
-		// Get UUIDs for both indices
-		// Note: checkpointIndex refers to the original GPU, but we need its UUID from THIS node
-		// If the checkpoint was from a different node, we might not have that UUID
-		// For same-node restore to different GPU: we have both UUIDs
-		// For cross-node restore: we need to get checkpoint UUID from checkpoint metadata
+		// Skip if same GPU (no migration needed)
+		if checkpointIndex == targetIndex {
+			log.Infof(ctx, "Checkpoint and target are same GPU %d, no mapping needed", checkpointIndex)
+			continue
+		}
 
-		// For now, assume same-node restore - both GPUs exist on this node
+		// Get UUIDs for both indices
 		checkpointUUID, ok := gpuUUIDs[checkpointIndex]
 		if !ok {
 			log.Warnf(ctx, "No UUID found for checkpoint GPU index %d - assuming cross-node restore", checkpointIndex)
-			// For cross-node restore, we would need to get the UUID from checkpoint metadata
-			// For now, skip this mapping
 			continue
 		}
 
@@ -302,12 +307,24 @@ func createCUDADeviceMap(ctx context.Context, checkpointGPUPaths, targetGPUPaths
 			return "", fmt.Errorf("no UUID found for target GPU index %d", targetIndex)
 		}
 
-		// Format: GPU-oldUUID=GPU-newUUID
-		mapping := fmt.Sprintf("%s=%s", checkpointUUID, targetUUID)
-		mappings = append(mappings, mapping)
+		// Create BIDIRECTIONAL mapping: old->new AND new->old
+		// This is required by cuda-checkpoint for proper GPU migration
+		mapping1 := fmt.Sprintf("%s=%s", checkpointUUID, targetUUID)
+		mapping2 := fmt.Sprintf("%s=%s", targetUUID, checkpointUUID)
 
-		log.Infof(ctx, "CUDA device map: GPU %d (%s) -> GPU %d (%s)",
-			checkpointIndex, checkpointUUID, targetIndex, targetUUID)
+		if !mappingSet[mapping1] {
+			mappingSet[mapping1] = true
+			mappings = append(mappings, mapping1)
+			log.Infof(ctx, "CUDA device map (forward): GPU %d (%s) -> GPU %d (%s)",
+				checkpointIndex, checkpointUUID, targetIndex, targetUUID)
+		}
+
+		if !mappingSet[mapping2] {
+			mappingSet[mapping2] = true
+			mappings = append(mappings, mapping2)
+			log.Infof(ctx, "CUDA device map (reverse): GPU %d (%s) -> GPU %d (%s)",
+				targetIndex, targetUUID, checkpointIndex, checkpointUUID)
+		}
 	}
 
 	if len(mappings) == 0 {
@@ -315,7 +332,9 @@ func createCUDADeviceMap(ctx context.Context, checkpointGPUPaths, targetGPUPaths
 	}
 
 	// Join multiple mappings with comma
-	return strings.Join(mappings, ","), nil
+	deviceMap := strings.Join(mappings, ",")
+	log.Infof(ctx, "Full CUDA device map for cuda-checkpoint: %s", deviceMap)
+	return deviceMap, nil
 }
 
 // createNVIDIAMount creates an NVIDIA mount from the dumpSpec mount information
@@ -668,6 +687,9 @@ func (s *Server) CRImportCheckpoint(
 	createConfig *types.ContainerConfig,
 	sb *sandbox.Sandbox, sandboxUID string,
 ) (ctrID string, retErr error) {
+	log.Infof(ctx, "=== CRImportCheckpoint called: container=%s, image=%s ===",
+		createConfig.GetMetadata().GetName(), createConfig.GetImage().GetImage())
+	
 	var mountPoint string
 
 	// Ensure that the image to restore the checkpoint from has been provided.
@@ -872,6 +894,7 @@ func (s *Server) CRImportCheckpoint(
 	// use a different GPU (e.g., /dev/nvidia0).
 	cdiDevicesFromConfig := createConfig.GetCDIDevices()
 	hasCDIDevices := len(cdiDevicesFromConfig) > 0
+	log.Infof(ctx, "CDI devices check: hasCDIDevices=%v, count=%d", hasCDIDevices, len(cdiDevicesFromConfig))
 
 	// Resolve CDI device references to get the actual NVIDIA GPU device host paths
 	var cdiGPUHostPaths []string
@@ -963,6 +986,173 @@ func (s *Server) CRImportCheckpoint(
 					log.Infof(ctx, "GPU device rename mapping: CDI path %s -> checkpoint path %s",
 						cdiPath, checkpointPath)
 				}
+			}
+		}
+
+		// CRITICAL: Modify dumpSpec.Linux.Devices to update GPU device minor numbers
+		// CRIU restores device nodes from dumpSpec, so we need to update the minor numbers
+		// in dumpSpec before CRIU uses it. This ensures CRIU restores devices with correct minor numbers.
+		log.Infof(ctx, "GPU migration check: cdiGPUHostPaths=%d, checkpointGPUDevices=%d, dumpSpec.Linux=%v, dumpSpec.Linux.Devices=%v",
+			len(cdiGPUHostPaths), len(checkpointGPUDevices), dumpSpec.Linux != nil,
+			dumpSpec.Linux != nil && dumpSpec.Linux.Devices != nil)
+		
+		if len(cdiGPUHostPaths) > 0 && len(checkpointGPUDevices) > 0 && dumpSpec.Linux != nil && dumpSpec.Linux.Devices != nil {
+			log.Infof(ctx, "Modifying dumpSpec for GPU migration: %d checkpoint devices, %d CDI devices",
+				len(checkpointGPUDevices), len(cdiGPUHostPaths))
+
+			// Get GPU indices to find target minor numbers
+			for i, checkpointPath := range checkpointGPUDevices {
+				if i >= len(cdiGPUHostPaths) {
+					log.Warnf(ctx, "No CDI device for checkpoint device %s (index %d)", checkpointPath, i)
+					break
+				}
+				cdiPath := cdiGPUHostPaths[i]
+
+				// Get target GPU index from CDI path (e.g., /dev/nvidia0 -> 0)
+				targetIndex, err := getGPUIndexFromDevicePath(cdiPath)
+				if err != nil {
+					log.Warnf(ctx, "Failed to get target GPU index from %s: %v", cdiPath, err)
+					continue
+				}
+
+				// Update dumpSpec device to use target GPU's minor number
+				// Target GPU minor number = GPU index (e.g., GPU-0 has minor=0)
+				targetMinor := int64(targetIndex)
+				found := false
+				for j := range dumpSpec.Linux.Devices {
+					if dumpSpec.Linux.Devices[j].Path == checkpointPath {
+						oldMinor := dumpSpec.Linux.Devices[j].Minor
+						dumpSpec.Linux.Devices[j].Minor = targetMinor
+						log.Infof(ctx, "Updated dumpSpec device %s: minor %d -> %d (target GPU %d)",
+							checkpointPath, oldMinor, targetMinor, targetIndex)
+						found = true
+						break
+					}
+				}
+				if !found {
+					log.Warnf(ctx, "Checkpoint device %s not found in dumpSpec.Linux.Devices", checkpointPath)
+				}
+			}
+
+			// Write the modified dumpSpec back to the checkpoint directory
+			// CRIU will read this modified spec during restore
+			if _, err := metadata.WriteJSONFile(dumpSpec, mountPoint, metadata.SpecDumpFile); err != nil {
+				log.Warnf(ctx, "Failed to write modified dumpSpec: %v (CRIU may restore with wrong device minor numbers)", err)
+			} else {
+				log.Infof(ctx, "Wrote modified dumpSpec with updated GPU device minor numbers")
+			}
+
+			// CRITICAL: Update device nodes in checkpoint's /dev directory
+			// CRIU restores /dev from checkpoint filesystem, so we need to update
+			// the actual device node files in the checkpoint to have correct minor numbers.
+			// This ensures CRIU restores devices with correct minor numbers for GPU migration.
+			checkpointDevDir := filepath.Join(mountPoint, "rootfs", "dev")
+			for i, checkpointPath := range checkpointGPUDevices {
+				if i >= len(cdiGPUHostPaths) {
+					break
+				}
+				cdiPath := cdiGPUHostPaths[i]
+				
+				// Get target GPU index from CDI path (e.g., /dev/nvidia0 -> 0)
+				targetIndex, err := getGPUIndexFromDevicePath(cdiPath)
+				if err != nil {
+					log.Warnf(ctx, "Failed to get target GPU index from %s: %v", cdiPath, err)
+					continue
+				}
+
+				// Device node filename (e.g., /dev/nvidia1 -> nvidia1)
+				deviceName := filepath.Base(checkpointPath)
+				devicePath := filepath.Join(checkpointDevDir, deviceName)
+				
+				// Check if device node exists in checkpoint
+				if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+					log.Debugf(ctx, "Device node %s does not exist in checkpoint /dev", devicePath)
+					continue
+				}
+
+				// Get current device info
+				var stat unix.Stat_t
+				if err := unix.Stat(devicePath, &stat); err != nil {
+					log.Warnf(ctx, "Failed to stat device %s: %v", devicePath, err)
+					continue
+				}
+
+				// Update device node: major stays same (195 for NVIDIA), minor = target GPU index
+				targetMinor := uint32(targetIndex)
+				currentMajor := unix.Major(stat.Rdev)
+				currentMinor := unix.Minor(stat.Rdev)
+				if currentMinor != targetMinor {
+					newRdev := unix.Mkdev(currentMajor, targetMinor)
+					
+					// Remove old device node
+					if err := os.Remove(devicePath); err != nil {
+						log.Warnf(ctx, "Failed to remove old device node %s: %v", devicePath, err)
+						continue
+					}
+					
+					// Create new device node with correct minor number
+					if err := unix.Mknod(devicePath, unix.S_IFCHR|0666, int(newRdev)); err != nil {
+						log.Warnf(ctx, "Failed to create device node %s with minor %d: %v", devicePath, targetMinor, err)
+						continue
+					}
+					
+					log.Infof(ctx, "Updated checkpoint device node %s: minor %d -> %d (target GPU %d)",
+						devicePath, currentMinor, targetMinor, targetIndex)
+				} else {
+					log.Debugf(ctx, "Device node %s already has correct minor=%d", devicePath, targetMinor)
+				}
+			}
+
+			// Also ensure /dev/nvidia0 exists in checkpoint if it's the target GPU
+			// This is needed when both GPUs are claimed - both should be present
+			for _, cdiPath := range cdiGPUHostPaths {
+				targetIndex, err := getGPUIndexFromDevicePath(cdiPath)
+				if err != nil {
+					continue
+				}
+				deviceName := filepath.Base(cdiPath) // e.g., "nvidia0"
+				devicePath := filepath.Join(checkpointDevDir, deviceName)
+				
+				// Check if device node exists
+				if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+					// Create device node for target GPU
+					major := uint32(195) // NVIDIA device major number
+					minor := uint32(targetIndex)
+					rdev := unix.Mkdev(major, minor)
+					if err := unix.Mknod(devicePath, unix.S_IFCHR|0666, int(rdev)); err != nil {
+						log.Debugf(ctx, "Could not create device node %s (may not be needed): %v", devicePath, err)
+					} else {
+						log.Infof(ctx, "Created device node %s in checkpoint: major=195, minor=%d", devicePath, minor)
+					}
+				}
+			}
+
+			// Log checkpoint /dev directory contents before CRIU restore
+			// This shows what device nodes CRIU will restore from the checkpoint
+			// checkpointDevDir is already declared above
+			if entries, readErr := os.ReadDir(checkpointDevDir); readErr == nil {
+				log.Infof(ctx, "=== Checkpoint /dev directory contents (before CRIU restore) ===")
+				for _, entry := range entries {
+					if entry.IsDir() {
+						continue
+					}
+					devicePath := filepath.Join(checkpointDevDir, entry.Name())
+					var stat unix.Stat_t
+					if statErr := unix.Stat(devicePath, &stat); statErr == nil {
+						if stat.Mode&unix.S_IFMT == unix.S_IFCHR || stat.Mode&unix.S_IFMT == unix.S_IFBLK {
+							major := unix.Major(stat.Rdev)
+							minor := unix.Minor(stat.Rdev)
+							deviceType := "c"
+							if stat.Mode&unix.S_IFMT == unix.S_IFBLK {
+								deviceType = "b"
+							}
+							log.Infof(ctx, "  %s: type=%s, major=%d, minor=%d", entry.Name(), deviceType, major, minor)
+						}
+					}
+				}
+				log.Infof(ctx, "=== End of checkpoint /dev directory contents ===")
+			} else {
+				log.Warnf(ctx, "Failed to read checkpoint /dev directory: %v", readErr)
 			}
 		}
 

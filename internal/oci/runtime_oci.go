@@ -95,8 +95,8 @@ func (r *runtimeOCI) hasNVIDIAContainer(c *Container) bool {
 	if c.Spec().Linux != nil && c.Spec().Linux.Devices != nil {
 		for _, device := range c.Spec().Linux.Devices {
 			// Check for NVIDIA GPU devices
-			if strings.Contains(device.Path, "nvidia") || 
-			   strings.Contains(device.Path, "/dev/dri") {
+			if strings.Contains(device.Path, "nvidia") ||
+				strings.Contains(device.Path, "/dev/dri") {
 				return true
 			}
 		}
@@ -106,9 +106,9 @@ func (r *runtimeOCI) hasNVIDIAContainer(c *Container) bool {
 	if c.Spec().Mounts != nil {
 		for _, mount := range c.Spec().Mounts {
 			if strings.Contains(mount.Source, "nvidia") ||
-			   strings.Contains(mount.Destination, "nvidia") ||
-			   strings.Contains(mount.Source, "cuda") ||
-			   strings.Contains(mount.Destination, "cuda") {
+				strings.Contains(mount.Destination, "nvidia") ||
+				strings.Contains(mount.Source, "cuda") ||
+				strings.Contains(mount.Destination, "cuda") {
 				return true
 			}
 		}
@@ -117,9 +117,9 @@ func (r *runtimeOCI) hasNVIDIAContainer(c *Container) bool {
 	// Check for NVIDIA environment variables
 	if c.Spec().Process != nil && c.Spec().Process.Env != nil {
 		for _, env := range c.Spec().Process.Env {
-			if strings.Contains(env, "NVIDIA") || 
-			   strings.Contains(env, "CUDA") ||
-			   strings.Contains(env, "GPU") {
+			if strings.Contains(env, "NVIDIA") ||
+				strings.Contains(env, "CUDA") ||
+				strings.Contains(env, "GPU") {
 				return true
 			}
 		}
@@ -129,9 +129,9 @@ func (r *runtimeOCI) hasNVIDIAContainer(c *Container) bool {
 	if c.Spec().Annotations != nil {
 		for key, value := range c.Spec().Annotations {
 			if strings.Contains(strings.ToLower(key), "nvidia") ||
-			   strings.Contains(strings.ToLower(value), "nvidia") ||
-			   strings.Contains(strings.ToLower(key), "gpu") ||
-			   strings.Contains(strings.ToLower(value), "gpu") {
+				strings.Contains(strings.ToLower(value), "nvidia") ||
+				strings.Contains(strings.ToLower(key), "gpu") ||
+				strings.Contains(strings.ToLower(value), "gpu") {
 				return true
 			}
 		}
@@ -139,8 +139,6 @@ func (r *runtimeOCI) hasNVIDIAContainer(c *Container) bool {
 
 	return false
 }
-
-
 
 // syncInfo is used to return data from monitor process to daemon.
 type syncInfo struct {
@@ -249,16 +247,16 @@ func (r *runtimeOCI) CreateContainer(ctx context.Context, c *Container, cgroupPa
 		if r.hasNVIDIAContainer(c) {
 			log.Debugf(ctx, "Detected NVIDIA container, adding CRIU options for GPU restore")
 			// log.Debugf(ctx, "NVIDIA external mount mappings will be loaded from /etc/criu/default.conf")
-			
-			// Use ignore mode for cgroup management to avoid GPU cgroup conflicts  
+
+			// Use ignore mode for cgroup management to avoid GPU cgroup conflicts
 			// args = append(args, "--runtime-opt", "--manage-cgroups-mode=ignore")
-			
+
 			// Allow external unix sockets for NVIDIA communication
 			// args = append(args, "--runtime-opt", "--ext-unix-sk")
-			
+
 			// Allow shell jobs to handle NVIDIA process trees
 			// args = append(args, "--runtime-opt", "--shell-job")
-			
+
 			// Enable file locks which NVIDIA drivers may use
 			// args = append(args, "--runtime-opt", "--file-locks")
 		}

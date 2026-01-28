@@ -1206,26 +1206,24 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
 		return nil, err
 	}
 
-	// Apply GPU device rename mapping for restore cases
-	// This renames CDI-created device paths to match what the checkpoint expects
+	// Handle GPU restore with migration support
+	// Check if CUDA device map is present (GPU migration via cuda-checkpoint --device-map)
+	cudaDeviceMapPresent := false
+	if cudaMap, ok := ctr.Config().GetAnnotations()[crioann.CheckpointAnnotationCUDADeviceMap]; ok && cudaMap != "" {
+		cudaDeviceMapPresent = true
+		log.Infof(ctx, "GPU migration mode: cuda-checkpoint --device-map will handle GPU migration")
+		log.Infof(ctx, "GPU migration: NOT renaming device paths - CDI device paths will be used as-is")
+	}
+
+	// Apply GPU device rename mapping for restore cases (only when NOT using cuda-checkpoint device-map)
+	// When cuda-checkpoint --device-map is used, it handles GPU migration internally via UUID mapping,
+	// so we should NOT rename device paths - let CDI inject the target GPU path directly.
 	if mappingJSON, ok := ctr.Config().GetAnnotations()[crioann.CheckpointAnnotationGPUDeviceMapping]; ok && mappingJSON != "" {
 		var gpuDeviceRenameMapping map[string]string
 		if err := json.Unmarshal([]byte(mappingJSON), &gpuDeviceRenameMapping); err != nil {
 			log.Warnf(ctx, "Failed to parse GPU device rename mapping: %v", err)
 		} else if len(gpuDeviceRenameMapping) > 0 {
-			log.Infof(ctx, "Applying GPU device rename mapping for restore: %v", gpuDeviceRenameMapping)
 			specgen := ctr.Spec()
-
-			// Debug: Log hooks after CDI injection
-			if specgen.Config.Hooks != nil {
-				log.Infof(ctx, "OCI spec hooks after CDI injection:")
-				for _, h := range specgen.Config.Hooks.Prestart {
-					log.Infof(ctx, "  Prestart hook: path=%s, args=%v", h.Path, h.Args)
-				}
-				for _, h := range specgen.Config.Hooks.CreateRuntime {
-					log.Infof(ctx, "  CreateRuntime hook: path=%s, args=%v", h.Path, h.Args)
-				}
-			}
 
 			// Debug: Log all devices after CDI injection
 			if specgen.Config.Linux != nil && specgen.Config.Linux.Devices != nil {
@@ -1237,86 +1235,151 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
 				}
 			}
 
-			if specgen.Config.Linux != nil {
-				// Rename device paths in the OCI spec
-				for i, dev := range specgen.Config.Linux.Devices {
-					if newPath, ok := gpuDeviceRenameMapping[dev.Path]; ok {
-						log.Infof(ctx, "Renaming GPU device in OCI spec: %s -> %s (major=%d, minor=%d)",
-							dev.Path, newPath, dev.Major, dev.Minor)
-						specgen.Config.Linux.Devices[i].Path = newPath
-					}
-				}
-				// Also update device cgroup rules if present
-				if specgen.Config.Linux.Resources != nil {
-					for i, devCgroup := range specgen.Config.Linux.Resources.Devices {
-						// Device cgroup rules don't have paths, just major/minor
-						// Log for debugging
-						if devCgroup.Major != nil && devCgroup.Minor != nil {
-							log.Debugf(ctx, "Device cgroup rule: type=%s, major=%d, minor=%d, access=%s",
-								devCgroup.Type, *devCgroup.Major, *devCgroup.Minor, devCgroup.Access)
-						}
-						_ = i // Suppress unused variable warning
-					}
-				}
+			// Note: Device path renaming is now done in the NVIDIA_VISIBLE_DEVICES handling section below
+			// to ensure it happens with NVIDIA_VISIBLE_DEVICES=void set
+			log.Infof(ctx, "GPU device rename mapping available: %v", gpuDeviceRenameMapping)
 
-				// Debug: Log devices AFTER rename
-				log.Infof(ctx, "OCI spec NVIDIA devices AFTER rename:")
-				for _, dev := range specgen.Config.Linux.Devices {
-					if strings.Contains(dev.Path, "nvidia") {
-						log.Infof(ctx, "  NVIDIA device: path=%s, major=%d, minor=%d", dev.Path, dev.Major, dev.Minor)
-					}
-				}
-			}
-
-			// CRITICAL: Remove CDI-related annotations to prevent nvidia-container-runtime
-			// from re-processing CDI and overwriting our device mapping.
-			// nvidia-container-runtime.cdi looks for these annotations and creates devices
-			// based on CDI specs, ignoring our renamed device paths.
-			if specgen.Config.Annotations != nil {
-				annotationsToRemove := []string{}
-				for key := range specgen.Config.Annotations {
-					// Remove CDI device annotations (cdi.k8s.io/*)
-					if strings.HasPrefix(key, "cdi.k8s.io") {
-						annotationsToRemove = append(annotationsToRemove, key)
-					}
-				}
-				for _, key := range annotationsToRemove {
-					log.Infof(ctx, "Removing CDI annotation to prevent nvidia-runtime re-processing: %s", key)
-					delete(specgen.Config.Annotations, key)
-				}
-			}
-
-			// CRITICAL: Fix NVIDIA_VISIBLE_DEVICES to prevent nvidia-container-runtime
-			// from re-injecting devices with wrong minor numbers.
-			// The checkpoint has NVIDIA_VISIBLE_DEVICES=all which causes nvidia-runtime
-			// to inject all GPUs, overriding our carefully configured devices.
-			// We need to remove duplicates and set it to the target GPU only.
+			// Handle NVIDIA_VISIBLE_DEVICES for nvidia-container-runtime
+			// For GPU migration with cuda-checkpoint, we need to:
+			// 1. Rename device paths to match checkpoint (e.g., /dev/nvidia0 -> /dev/nvidia1)
+			// 2. Set NVIDIA_VISIBLE_DEVICES=void to prevent nvidia-runtime from overriding
+			// 3. Let cuda-checkpoint handle CUDA context migration via UUID mapping
 			if specgen.Config.Process != nil {
-				// Remove ALL existing NVIDIA_VISIBLE_DEVICES entries
+				// Remove ALL existing NVIDIA_VISIBLE_DEVICES entries from checkpoint
 				newEnv := []string{}
 				for _, env := range specgen.Config.Process.Env {
 					if strings.HasPrefix(env, "NVIDIA_VISIBLE_DEVICES=") {
-						log.Infof(ctx, "Removing duplicate NVIDIA_VISIBLE_DEVICES: %s", env)
-						continue // Skip this entry
+						log.Infof(ctx, "Removing NVIDIA_VISIBLE_DEVICES from checkpoint: %s", env)
+						continue // Skip this entry - it's from checkpoint
 					}
 					newEnv = append(newEnv, env)
 				}
 
-				// CRITICAL: Set NVIDIA_VISIBLE_DEVICES=void to prevent nvidia-container-runtime
-				// from creating its own device nodes. With "void", the nvidia runtime passes
-				// through to runc without modifying devices, so our renamed device paths
-				// (from CDI injection) will be used as-is.
-				//
-				// The CDI injection has already added the devices with correct major/minor
-				// numbers (e.g., /dev/nvidia0 with minor=0), and we've renamed them to
-				// match the checkpoint path (e.g., /dev/nvidia1). Setting NVIDIA_VISIBLE_DEVICES=void
-				// ensures the nvidia runtime doesn't override these with its own device creation.
-				//
-				// Note: CDI injection also adds all required library mounts and other env vars,
-				// so GPU functionality is preserved even with NVIDIA_VISIBLE_DEVICES=void.
+				// ALWAYS set NVIDIA_VISIBLE_DEVICES=void for GPU migration restore
+				// This tells nvidia-runtime to NOT create any devices via legacy mode,
+				// so CDI-injected devices (which we rename) are used as-is.
+				// cuda-checkpoint --device-map handles the CUDA context migration.
 				newEnv = append(newEnv, "NVIDIA_VISIBLE_DEVICES=void")
 				specgen.Config.Process.Env = newEnv
-				log.Infof(ctx, "Set NVIDIA_VISIBLE_DEVICES=void to prevent nvidia-runtime device override")
+				log.Infof(ctx, "Set NVIDIA_VISIBLE_DEVICES=void for GPU migration restore")
+
+				// Check if device renaming/adjustment is needed for GPU migration
+				// When both GPUs are claimed, CDI provides both /dev/nvidia0 and /dev/nvidia1
+				// But checkpoint expects /dev/nvidia1 to point to GPU-0 hardware (minor=0)
+				// So we need to ensure checkpoint device paths point to the correct hardware
+				if cudaDeviceMapPresent && specgen.Config.Linux != nil {
+					// Build map of existing devices by path
+					existingDevices := make(map[string]*rspec.LinuxDevice)
+					for i := range specgen.Config.Linux.Devices {
+						dev := &specgen.Config.Linux.Devices[i]
+						if strings.HasPrefix(dev.Path, "/dev/nvidia") {
+							existingDevices[dev.Path] = dev
+							log.Debugf(ctx, "CDI provided device: %s (major=%d, minor=%d)", dev.Path, dev.Major, dev.Minor)
+						}
+					}
+
+					// For each checkpoint device path, ensure it points to the correct hardware
+					// gpuDeviceRenameMapping: {"/dev/nvidia0": "/dev/nvidia1"} means
+					// CDI provides /dev/nvidia0 (target GPU), checkpoint expects /dev/nvidia1
+					for cdiPath, checkpointPath := range gpuDeviceRenameMapping {
+						cdiDev, cdiExists := existingDevices[cdiPath]
+						checkpointDev, checkpointExists := existingDevices[checkpointPath]
+
+						log.Infof(ctx, "Processing device mapping: CDI %s (exists=%v) -> Checkpoint %s (exists=%v)",
+							cdiPath, cdiExists, checkpointPath, checkpointExists)
+
+						if checkpointExists {
+							// Checkpoint path exists - check if it has correct minor number
+							// It should have the same minor as the CDI target device
+							if cdiExists && checkpointDev.Minor != cdiDev.Minor {
+								log.Infof(ctx, "Checkpoint device %s has wrong minor (%d), should be %d (from %s)",
+									checkpointPath, checkpointDev.Minor, cdiDev.Minor, cdiPath)
+								log.Infof(ctx, "Updating checkpoint device %s to use minor=%d from %s",
+									checkpointPath, cdiDev.Minor, cdiPath)
+								// Update the checkpoint device to use the CDI device's minor number
+								found := false
+								for i := range specgen.Config.Linux.Devices {
+									if specgen.Config.Linux.Devices[i].Path == checkpointPath {
+										oldMinor := specgen.Config.Linux.Devices[i].Minor
+										specgen.Config.Linux.Devices[i].Minor = cdiDev.Minor
+										specgen.Config.Linux.Devices[i].Major = cdiDev.Major
+										log.Infof(ctx, "Updated device %s: minor %d -> %d, major=%d",
+											checkpointPath, oldMinor, cdiDev.Minor, cdiDev.Major)
+										found = true
+										break
+									}
+								}
+								if !found {
+									log.Warnf(ctx, "Failed to find device %s in spec to update", checkpointPath)
+								}
+							} else if cdiExists {
+								log.Infof(ctx, "Checkpoint device %s already has correct minor=%d", checkpointPath, checkpointDev.Minor)
+							} else {
+								log.Warnf(ctx, "Checkpoint device %s exists but CDI device %s not found", checkpointPath, cdiPath)
+							}
+						} else if cdiExists {
+							// Checkpoint path doesn't exist - rename CDI device
+							log.Infof(ctx, "Renaming GPU device: %s -> %s (major=%d, minor=%d)",
+								cdiPath, checkpointPath, cdiDev.Major, cdiDev.Minor)
+							found := false
+							for i := range specgen.Config.Linux.Devices {
+								if specgen.Config.Linux.Devices[i].Path == cdiPath {
+									specgen.Config.Linux.Devices[i].Path = checkpointPath
+									log.Infof(ctx, "Renamed device path: %s -> %s", cdiPath, checkpointPath)
+									found = true
+									break
+								}
+							}
+							if !found {
+								log.Warnf(ctx, "Failed to find device %s in spec to rename", cdiPath)
+							}
+						} else {
+							log.Warnf(ctx, "Neither CDI device %s nor checkpoint device %s found", cdiPath, checkpointPath)
+						}
+					}
+
+					// Ensure both /dev/nvidia0 and checkpoint device are present
+					// When both GPUs are claimed, we need both devices visible
+					hasNvidia0 := false
+					for _, dev := range specgen.Config.Linux.Devices {
+						if dev.Path == "/dev/nvidia0" {
+							hasNvidia0 = true
+							break
+						}
+					}
+
+					// If both GPUs were claimed but /dev/nvidia0 is missing, add it back
+					// This can happen if nvidia-runtime removes it
+					if !hasNvidia0 {
+						for cdiPath := range gpuDeviceRenameMapping {
+							if cdiPath == "/dev/nvidia0" {
+								cdiDev := existingDevices[cdiPath]
+								if cdiDev != nil {
+									log.Infof(ctx, "Adding missing /dev/nvidia0 device (major=%d, minor=%d)", cdiDev.Major, cdiDev.Minor)
+									specgen.Config.Linux.Devices = append(specgen.Config.Linux.Devices, rspec.LinuxDevice{
+										Path:  "/dev/nvidia0",
+										Type:  "c",
+										Major: cdiDev.Major,
+										Minor: cdiDev.Minor,
+									})
+								}
+								break
+							}
+						}
+					}
+
+					// Log final device state
+					log.Infof(ctx, "Final GPU devices after migration setup:")
+					for _, dev := range specgen.Config.Linux.Devices {
+						if strings.HasPrefix(dev.Path, "/dev/nvidia") {
+							// Check if it's a GPU index device (not ctl, uvm, modeset, etc.)
+							suffix := strings.TrimPrefix(dev.Path, "/dev/nvidia")
+							if len(suffix) > 0 && suffix[0] >= '0' && suffix[0] <= '9' {
+								log.Infof(ctx, "  %s: major=%d, minor=%d", dev.Path, dev.Major, dev.Minor)
+							}
+						}
+					}
+				}
 
 				// Log NVIDIA environment variables for debugging
 				for _, env := range specgen.Config.Process.Env {
@@ -1326,14 +1389,16 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
 				}
 			}
 
-			log.Infof(ctx, "GPU device rename complete - NVIDIA_VISIBLE_DEVICES set to target GPU, devices in linux.devices")
+			log.Infof(ctx, "GPU restore setup complete")
 		}
 	}
 
-	// Add CUDA_DEVICE_MAP environment variable for GPU migration (requires NVIDIA driver 580+)
+	// Add CUDA_DEVICE_MAP for GPU migration (requires NVIDIA driver 580+)
 	// This is used by the CRIU cuda plugin to pass --device-map to cuda-checkpoint
 	if cudaDeviceMap, ok := ctr.Config().GetAnnotations()[crioann.CheckpointAnnotationCUDADeviceMap]; ok && cudaDeviceMap != "" {
 		log.Infof(ctx, "Adding CUDA_DEVICE_MAP for GPU migration: %s", cudaDeviceMap)
+
+		// Add to container's environment (for reference)
 		specgen := ctr.Spec()
 		if specgen.Config.Process != nil {
 			// Remove any existing CUDA_DEVICE_MAP
@@ -1346,7 +1411,32 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
 			// Add the CUDA_DEVICE_MAP from annotation
 			newEnv = append(newEnv, "CUDA_DEVICE_MAP="+cudaDeviceMap)
 			specgen.Config.Process.Env = newEnv
-			log.Infof(ctx, "Set CUDA_DEVICE_MAP=%s for CRIU cuda plugin", cudaDeviceMap)
+			log.Infof(ctx, "Set CUDA_DEVICE_MAP=%s in container env", cudaDeviceMap)
+		}
+
+		// CRITICAL: Write CUDA_DEVICE_MAP to files for CRIU cuda plugin to read
+		// CRIU runs as a separate process and cannot read container's env vars.
+		// The plugin will read from these files during restore.
+
+		// Write to container-specific location (for reference)
+		deviceMapFile := filepath.Join(containerInfo.RunDir, "cuda-device-map")
+		if err := os.WriteFile(deviceMapFile, []byte(cudaDeviceMap), 0644); err != nil {
+			log.Warnf(ctx, "Failed to write CUDA device map file %s: %v", deviceMapFile, err)
+		} else {
+			log.Infof(ctx, "Wrote CUDA_DEVICE_MAP to container dir: %s", deviceMapFile)
+		}
+
+		// Write to well-known global location that CRIU plugin can easily find
+		// This is a simple approach that works for single restore operations
+		globalDeviceMapDir := "/run/crio"
+		if err := os.MkdirAll(globalDeviceMapDir, 0755); err != nil {
+			log.Warnf(ctx, "Failed to create CRIU device map dir %s: %v", globalDeviceMapDir, err)
+		}
+		globalDeviceMapFile := filepath.Join(globalDeviceMapDir, "cuda-device-map")
+		if err := os.WriteFile(globalDeviceMapFile, []byte(cudaDeviceMap), 0644); err != nil {
+			log.Warnf(ctx, "Failed to write global CUDA device map file %s: %v", globalDeviceMapFile, err)
+		} else {
+			log.Infof(ctx, "Wrote CUDA_DEVICE_MAP to global location for CRIU plugin: %s", globalDeviceMapFile)
 		}
 	}
 
