@@ -639,6 +639,14 @@ func (s *Server) CRImportCheckpoint(
 		Labels: createLabels,
 	}
 
+	// Reuse CDI devices requested for this restore so that GPU and other
+	// CDI-managed devices are injected from the current node's CDI specs,
+	// instead of relying on the checkpoint's concrete /dev/* devices (which
+	// we skip for NVIDIA below).
+	if len(createConfig.GetCDIDevices()) > 0 {
+		containerConfig.CDIDevices = createConfig.GetCDIDevices()
+	}
+
 	if createConfig.GetLinux() != nil {
 		if createConfig.GetLinux().GetResources() != nil {
 			containerConfig.Linux.Resources = createConfig.GetLinux().GetResources()
@@ -660,6 +668,10 @@ func (s *Server) CRImportCheckpoint(
 
 		if dumpSpec.Linux.Devices != nil {
 			for _, d := range dumpSpec.Linux.Devices {
+				if strings.HasPrefix(d.Path, "/dev/nvidia") {
+					continue
+				}
+
 				device := &types.Device{
 					ContainerPath: d.Path,
 					HostPath:      d.Path,
