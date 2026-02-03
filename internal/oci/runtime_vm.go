@@ -16,8 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	cgroupsV1 "github.com/containerd/cgroups/stats/v1"
-	cgroupsV2 "github.com/containerd/cgroups/v2/stats"
 	"github.com/containerd/containerd/api/runtime/task/v2"
 	containerdTypes "github.com/containerd/containerd/api/types"
 	tasktypes "github.com/containerd/containerd/api/types/task"
@@ -41,9 +39,8 @@ import (
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
 	utilexec "k8s.io/utils/exec"
 
-	"github.com/cri-o/cri-o/internal/config/cgmgr"
+	"github.com/cri-o/cri-o/internal/annotations"
 	"github.com/cri-o/cri-o/internal/log"
-	"github.com/cri-o/cri-o/pkg/annotations"
 	"github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/cri-o/server/metrics"
 	"github.com/cri-o/cri-o/utils"
@@ -53,6 +50,8 @@ import (
 // runtimeVM is the Runtime interface implementation that is more appropriate
 // for VM based container runtimes.
 type runtimeVM struct {
+	sync.Mutex
+
 	path       string
 	fifoDir    string
 	configPath string
@@ -61,8 +60,8 @@ type runtimeVM struct {
 	ctx        context.Context
 	client     *ttrpc.Client
 	task       task.TaskService
+	handler    *config.RuntimeHandler
 
-	sync.Mutex
 	ctrs map[string]containerInfo
 }
 
@@ -103,8 +102,14 @@ func newRuntimeVM(handler *config.RuntimeHandler, exitsPath string) RuntimeImpl 
 		pullImage:  handler.RuntimePullImage,
 		fifoDir:    filepath.Join(handler.RuntimeRoot, "crio", "fifo"),
 		ctx:        context.Background(),
+		handler:    handler,
 		ctrs:       make(map[string]containerInfo),
 	}
+}
+
+// getFIFOPath returns the FIFO path for the container.
+func (r *runtimeVM) getFIFOPath() string {
+	return filepath.Join(r.handler.RuntimeRoot, "crio", "fifo")
 }
 
 func addVolumeMountsToCreateRequest(ctx context.Context, request *task.CreateTaskRequest, c *Container) error {
@@ -151,15 +156,18 @@ func (r *runtimeVM) CreateContainer(ctx context.Context, c *Container, cgroupPar
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
 
+	// Get the container create timeout for this runtime handler
+	timeout := time.Duration(r.handler.ContainerCreateTimeout) * time.Second
+
 	// Lets ensure we're able to properly get construct the Options
 	// that we'll pass to the ContainerCreateTask, as admins can set
 	// the runtime_config_path to an arbitrary location.  Also, lets
 	// fail early if something goes wrong.
 	var opts *anypb.Any = nil
 
-	if r.configPath != "" {
+	if r.handler.RuntimeConfigPath != "" {
 		runtimeOptions := &runtimeoptions.Options{
-			ConfigPath: r.configPath,
+			ConfigPath: r.handler.RuntimeConfigPath,
 		}
 
 		marshaledOtps, err := typeurl.MarshalAny(runtimeOptions)
@@ -175,7 +183,7 @@ func (r *runtimeVM) CreateContainer(ctx context.Context, c *Container, cgroupPar
 		return err
 	}
 
-	containerIO, err := r.createContainerIO(ctx, c, cio.WithNewFIFOs(r.fifoDir, c.terminal, c.stdin))
+	containerIO, err := r.createContainerIO(ctx, c, cio.WithNewFIFOs(r.getFIFOPath(), c.terminal, c.stdin))
 	if err != nil {
 		return err
 	}
@@ -205,18 +213,23 @@ func (r *runtimeVM) CreateContainer(ctx context.Context, c *Container, cgroupPar
 		Options:  opts,
 	}
 
-	if r.pullImage {
+	if r.handler.RuntimePullImage {
 		err := addVolumeMountsToCreateRequest(ctx, request, c)
 		if err != nil {
 			log.Warnf(ctx, "Failed to add KataVirtualVolume information to CreateContainer: %v", err)
 		}
 	}
 
-	createdCh := make(chan error)
+	// Use buffered channel to allow goroutine to complete asynchronously without blocking
+	createdCh := make(chan error, 1)
+
+	// Create a context with timeout for the task creation
+	taskCtx, taskCancel := context.WithTimeout(ctx, timeout)
+	defer taskCancel()
 
 	go func() {
 		// Create the container
-		if resp, err := r.task.Create(r.ctx, request); err != nil {
+		if resp, err := r.task.Create(taskCtx, request); err != nil {
 			createdCh <- errdefs.FromGRPC(err)
 		} else if err := c.state.SetInitPid(int(resp.GetPid())); err != nil {
 			createdCh <- err
@@ -230,14 +243,12 @@ func (r *runtimeVM) CreateContainer(ctx context.Context, c *Container, cgroupPar
 		if err != nil {
 			return fmt.Errorf("CreateContainer failed: %w", err)
 		}
-	case <-time.After(ContainerCreateTimeout):
+	case <-taskCtx.Done():
 		if err := r.remove(c.ID(), ""); err != nil {
-			return err
+			log.Warnf(ctx, "Failed to cleanup container %s after timeout (%v): %v", c.ID(), timeout, err)
 		}
 
-		<-createdCh
-
-		return fmt.Errorf("CreateContainer timeout (%v)", ContainerCreateTimeout)
+		return fmt.Errorf("Container creation timeout (%v)", timeout)
 	}
 
 	return nil
@@ -263,7 +274,7 @@ func (r *runtimeVM) startRuntimeDaemon(ctx context.Context, c *Container) error 
 	cmd, err := client.Command(
 		r.ctx,
 		&client.CommandConfig{
-			Runtime: r.path,
+			Runtime: r.handler.RuntimePath,
 			Path:    c.BundlePath(),
 			Args:    args,
 		},
@@ -468,7 +479,7 @@ func (r *runtimeVM) execContainerCommon(ctx context.Context, c *Container, cmd [
 	}
 
 	// Create IO fifos
-	execIO, err := cio.NewExecIO(c.ID(), r.fifoDir, tty, stdin != nil)
+	execIO, err := cio.NewExecIO(c.ID(), r.getFIFOPath(), tty, stdin != nil)
 	if err != nil {
 		return execError, errdefs.FromGRPC(err)
 	}
@@ -576,14 +587,14 @@ func (r *runtimeVM) execContainerCommon(ctx context.Context, c *Container, cmd [
 	select {
 	case err = <-execCh:
 		if err != nil {
-			if killErr := r.kill(c.ID(), execID, syscall.SIGKILL, false); killErr != nil {
+			if killErr := r.kill(c.ID(), execID, syscall.SIGKILL); killErr != nil {
 				return execError, killErr
 			}
 
 			return execError, err
 		}
 	case <-timeoutCh:
-		if killErr := r.kill(c.ID(), execID, syscall.SIGKILL, false); killErr != nil {
+		if killErr := r.kill(c.ID(), execID, syscall.SIGKILL); killErr != nil {
 			return execError, killErr
 		}
 
@@ -666,7 +677,7 @@ func (r *runtimeVM) StopContainer(ctx context.Context, c *Container, timeout int
 	if timeout > 0 {
 		sig = c.StopSignal()
 		// Send a stopping signal to the container
-		if err := r.kill(c.ID(), "", sig, false); err != nil {
+		if err := r.kill(c.ID(), "", sig); err != nil {
 			return err
 		}
 
@@ -684,7 +695,7 @@ func (r *runtimeVM) StopContainer(ctx context.Context, c *Container, timeout int
 
 	sig = syscall.SIGKILL
 	// Send a SIGKILL signal to the container
-	if err := r.kill(c.ID(), "", sig, false); err != nil {
+	if err := r.kill(c.ID(), "", sig); err != nil {
 		return err
 	}
 
@@ -902,7 +913,7 @@ func (r *runtimeVM) restoreContainerIO(ctx context.Context, c *Container, state 
 		Stderr:   state.GetStderr(),
 	}
 	// The existing fifos is created by NewFIFOSetInDir. stdin, stdout, stderr should exist
-	// in a same temporary directory under r.fifoDir. crio is responsible for removing these
+	// in a same temporary directory under the fifo directory. crio is responsible for removing these
 	// files after container io is closed.
 	var iofiles []string
 	if cioCfg.Stdin != "" {
@@ -1030,187 +1041,6 @@ func (r *runtimeVM) UnpauseContainer(ctx context.Context, c *Container) error {
 	return nil
 }
 
-// ContainerStats provides statistics of a container.
-func (r *runtimeVM) ContainerStats(ctx context.Context, c *Container, _ string) (*cgmgr.CgroupStats, error) {
-	log.Debugf(ctx, "RuntimeVM.ContainerStats() start")
-	defer log.Debugf(ctx, "RuntimeVM.ContainerStats() end")
-
-	// Lock the container with a shared lock
-	c.opLock.RLock()
-	defer c.opLock.RUnlock()
-
-	resp, err := r.task.Stats(r.ctx, &task.StatsRequest{
-		ID: c.ID(),
-	})
-	if err != nil {
-		return nil, errdefs.FromGRPC(err)
-	}
-
-	if resp == nil {
-		return nil, errors.New("could not retrieve container stats")
-	}
-
-	stats, err := typeurl.UnmarshalAny(resp.GetStats())
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract container metrics: %w", err)
-	}
-
-	// We can't assume the version of metrics we will get based on the host system,
-	// because the guest VM may be using a different version.
-	// Trying to retrieve the V1 metrics first, and if it fails, try the v2
-	m, ok := stats.(*cgroupsV1.Metrics)
-	if ok {
-		return metricsV1ToCgroupStats(ctx, m), nil
-	} else {
-		m, ok := stats.(*cgroupsV2.Metrics)
-		if ok {
-			return metricsV2ToCgroupStats(ctx, m), nil
-		}
-	}
-
-	return nil, fmt.Errorf("unknown stats type %T", stats)
-}
-
-func metricsV1ToCgroupStats(ctx context.Context, m *cgroupsV1.Metrics) *cgmgr.CgroupStats {
-	var (
-		memLimit        uint64
-		memUsage        uint64
-		workingSetBytes uint64
-	)
-
-	memUsage = m.Memory.Usage.Usage
-	memLimit = cgmgr.MemLimitGivenSystem(m.Memory.Usage.Limit)
-
-	if memUsage > m.Memory.TotalInactiveFile {
-		workingSetBytes = memUsage - m.Memory.TotalInactiveFile
-	} else {
-		log.Debugf(ctx,
-			"Unable to account working set stats: total_inactive_file (%d) > memory usage (%d)",
-			m.Memory.TotalInactiveFile, memUsage,
-		)
-	}
-
-	hugetlbStats := map[string]cgmgr.HugetlbStats{}
-	for _, hugetlb := range m.Hugetlb {
-		hugetlbStats[hugetlb.Pagesize] = cgmgr.HugetlbStats{
-			Usage: hugetlb.Usage,
-			Max:   hugetlb.Max,
-		}
-	}
-
-	return &cgmgr.CgroupStats{
-		Memory: &cgmgr.MemoryStats{
-			Usage:           memUsage,
-			WorkingSetBytes: workingSetBytes,
-			Limit:           memLimit,
-			AvailableBytes:  memLimit - workingSetBytes,
-			RssBytes:        m.Memory.RSS,
-			PageFaults:      m.Memory.PgFault,
-			MajorPageFaults: m.Memory.PgMajFault,
-			Cache:           m.Memory.Cache,
-			MaxUsage:        m.Memory.Usage.Max,
-			KernelUsage:     m.Memory.Kernel.Usage,
-			KernelTCPUsage:  m.Memory.KernelTCP.Usage,
-			SwapUsage:       m.Memory.Swap.Usage,
-			SwapLimit:       m.Memory.Swap.Limit,
-			// There is also m.Memory.TotalMappedFile
-			// TODO: See which one is the best to use here
-			FileMapped: m.Memory.MappedFile,
-			Failcnt:    m.Memory.Usage.Failcnt,
-		},
-		CPU: &cgmgr.CPUStats{
-			TotalUsageNano:          m.CPU.Usage.Total,
-			PerCPUUsage:             m.CPU.Usage.PerCPU,
-			ThrottledTime:           m.CPU.Throttling.ThrottledTime,
-			ThrottlingActivePeriods: m.CPU.Throttling.Periods,
-			ThrottledPeriods:        m.CPU.Throttling.ThrottledPeriods,
-		},
-		Hugetlb: hugetlbStats,
-		Pid: &cgmgr.PidsStats{
-			Current: m.Pids.Current,
-			Limit:   m.Pids.Limit,
-		},
-		SystemNano: time.Now().UnixNano(),
-	}
-}
-
-func metricsV2ToCgroupStats(ctx context.Context, m *cgroupsV2.Metrics) *cgmgr.CgroupStats {
-	var (
-		memLimit        uint64
-		memUsage        uint64
-		workingSetBytes uint64
-	)
-
-	if m != nil {
-		memUsage = m.Memory.Usage
-		memLimit = cgmgr.MemLimitGivenSystem(m.Memory.UsageLimit)
-
-		if memUsage > m.Memory.InactiveFile {
-			workingSetBytes = memUsage - m.Memory.InactiveFile
-		} else {
-			log.Debugf(ctx,
-				"Unable to account working set stats: total_inactive_file (%d) > memory usage (%d)",
-				m.Memory.InactiveFile, memUsage,
-			)
-		}
-	}
-
-	hugetlbStats := map[string]cgmgr.HugetlbStats{}
-	for _, hugetlb := range m.Hugetlb {
-		hugetlbStats[hugetlb.Pagesize] = cgmgr.HugetlbStats{
-			Usage: hugetlb.Current,
-			Max:   hugetlb.Max,
-		}
-	}
-
-	return &cgmgr.CgroupStats{
-		Memory: &cgmgr.MemoryStats{
-			Usage:           memUsage,
-			WorkingSetBytes: workingSetBytes,
-			Limit:           memLimit,
-			AvailableBytes:  memLimit - workingSetBytes,
-			PageFaults:      m.Memory.Pgfault,
-			MajorPageFaults: m.Memory.Pgmajfault,
-			// Use Memory.Anon as Rss for cgroup v2 as in cAdvisor
-			// See: https://github.com/google/cadvisor/blob/786dbcfdf5b1aae8341b47e71ab115066a9b4c06/container/libcontainer/handler.go#L809
-			RssBytes: m.Memory.Anon,
-			// Use Memory.File as Cache for cgroup v2 as in cAdvisor
-			// See: https://github.com/google/cadvisor/blob/786dbcfdf5b1aae8341b47e71ab115066a9b4c06/container/libcontainer/handler.go#L808
-			Cache:       m.Memory.File,
-			KernelUsage: m.Memory.KernelStack,
-			SwapUsage:   m.Memory.SwapUsage,
-			SwapLimit:   m.Memory.SwapLimit,
-			FileMapped:  m.Memory.FileMapped,
-		},
-		CPU: &cgmgr.CPUStats{
-			TotalUsageNano:          m.CPU.UsageUsec * 1000,
-			UsageInKernelmode:       m.CPU.SystemUsec * 1000,
-			UsageInUsermode:         m.CPU.UserUsec * 1000,
-			ThrottlingActivePeriods: m.CPU.NrPeriods,
-			ThrottledPeriods:        m.CPU.NrThrottled,
-			ThrottledTime:           m.CPU.ThrottledUsec * 1000,
-		},
-		Hugetlb: hugetlbStats,
-		Pid: &cgmgr.PidsStats{
-			Current: m.Pids.Current,
-			Limit:   m.Pids.Limit,
-		},
-		SystemNano: time.Now().UnixNano(),
-	}
-}
-
-// SignalContainer sends a signal to a container process.
-func (r *runtimeVM) SignalContainer(ctx context.Context, c *Container, sig syscall.Signal) error {
-	log.Debugf(ctx, "RuntimeVM.SignalContainer() start")
-	defer log.Debugf(ctx, "RuntimeVM.SignalContainer() end")
-
-	// Lock the container
-	c.opLock.Lock()
-	defer c.opLock.Unlock()
-
-	return r.kill(c.ID(), "", sig, true)
-}
-
 // AttachContainer attaches IO to a running container.
 func (r *runtimeVM) AttachContainer(ctx context.Context, c *Container, inputStream io.Reader, outputStream, errorStream io.WriteCloser, tty bool, resizeChan <-chan remotecommand.TerminalSize) error {
 	log.Debugf(ctx, "RuntimeVM.AttachContainer() start")
@@ -1244,7 +1074,7 @@ func (r *runtimeVM) AttachContainer(ctx context.Context, c *Container, inputStre
 		},
 	}
 
-	cInfo.cio.Attach(opts)
+	cInfo.cio.Attach(ctx, opts)
 
 	return nil
 }
@@ -1315,12 +1145,12 @@ func (r *runtimeVM) wait(ctrID, execID string) (int32, error) {
 	return int32(resp.GetExitStatus()), nil
 }
 
-func (r *runtimeVM) kill(ctrID, execID string, signal syscall.Signal, all bool) error {
+func (r *runtimeVM) kill(ctrID, execID string, signal syscall.Signal) error {
 	if _, err := r.task.Kill(r.ctx, &task.KillRequest{
 		ID:     ctrID,
 		ExecID: execID,
 		Signal: uint32(signal),
-		All:    all,
+		All:    false,
 	}); err != nil {
 		return errdefs.FromGRPC(err)
 	}
@@ -1395,7 +1225,7 @@ func EncodeKataVirtualVolumeToBase64(ctx context.Context, volume *katavolume.Kat
 }
 
 func (r *runtimeVM) IsContainerAlive(c *Container) bool {
-	return r.kill(c.ID(), "", 0, false) == nil
+	return r.kill(c.ID(), "", 0) == nil
 }
 
 func (r *runtimeVM) ProbeMonitor(ctx context.Context, c *Container) error {

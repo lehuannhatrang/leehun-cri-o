@@ -13,9 +13,8 @@ import (
 	context "context"
 	io "io"
 	reflect "reflect"
-	syscall "syscall"
 
-	cgmgr "github.com/cri-o/cri-o/internal/config/cgmgr"
+	stats "github.com/cri-o/cri-o/internal/lib/stats"
 	oci "github.com/cri-o/cri-o/internal/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	gomock "go.uber.org/mock/gomock"
@@ -61,6 +60,21 @@ func (mr *MockRuntimeImplMockRecorder) AttachContainer(arg0, arg1, arg2, arg3, a
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AttachContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).AttachContainer), arg0, arg1, arg2, arg3, arg4, arg5, arg6)
 }
 
+// CgroupStats mocks base method.
+func (m *MockRuntimeImpl) CgroupStats(arg0 context.Context, arg1 *oci.Container, arg2 string) (*stats.CgroupStats, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CgroupStats", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*stats.CgroupStats)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CgroupStats indicates an expected call of CgroupStats.
+func (mr *MockRuntimeImplMockRecorder) CgroupStats(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CgroupStats", reflect.TypeOf((*MockRuntimeImpl)(nil).CgroupStats), arg0, arg1, arg2)
+}
+
 // CheckpointContainer mocks base method.
 func (m *MockRuntimeImpl) CheckpointContainer(arg0 context.Context, arg1 *oci.Container, arg2 *specs.Spec, arg3 bool) error {
 	m.ctrl.T.Helper()
@@ -73,21 +87,6 @@ func (m *MockRuntimeImpl) CheckpointContainer(arg0 context.Context, arg1 *oci.Co
 func (mr *MockRuntimeImplMockRecorder) CheckpointContainer(arg0, arg1, arg2, arg3 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckpointContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).CheckpointContainer), arg0, arg1, arg2, arg3)
-}
-
-// ContainerStats mocks base method.
-func (m *MockRuntimeImpl) ContainerStats(arg0 context.Context, arg1 *oci.Container, arg2 string) (*cgmgr.CgroupStats, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ContainerStats", arg0, arg1, arg2)
-	ret0, _ := ret[0].(*cgmgr.CgroupStats)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// ContainerStats indicates an expected call of ContainerStats.
-func (mr *MockRuntimeImplMockRecorder) ContainerStats(arg0, arg1, arg2 any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ContainerStats", reflect.TypeOf((*MockRuntimeImpl)(nil).ContainerStats), arg0, arg1, arg2)
 }
 
 // CreateContainer mocks base method.
@@ -116,6 +115,21 @@ func (m *MockRuntimeImpl) DeleteContainer(arg0 context.Context, arg1 *oci.Contai
 func (mr *MockRuntimeImplMockRecorder) DeleteContainer(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).DeleteContainer), arg0, arg1)
+}
+
+// DiskStats mocks base method.
+func (m *MockRuntimeImpl) DiskStats(arg0 context.Context, arg1 *oci.Container, arg2 string) (*stats.DiskStats, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DiskStats", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*stats.DiskStats)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DiskStats indicates an expected call of DiskStats.
+func (mr *MockRuntimeImplMockRecorder) DiskStats(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DiskStats", reflect.TypeOf((*MockRuntimeImpl)(nil).DiskStats), arg0, arg1, arg2)
 }
 
 // ExecContainer mocks base method.
@@ -259,20 +273,6 @@ func (m *MockRuntimeImpl) ServeExecContainer(arg0 context.Context, arg1 *oci.Con
 func (mr *MockRuntimeImplMockRecorder) ServeExecContainer(arg0, arg1, arg2, arg3, arg4, arg5, arg6 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeExecContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).ServeExecContainer), arg0, arg1, arg2, arg3, arg4, arg5, arg6)
-}
-
-// SignalContainer mocks base method.
-func (m *MockRuntimeImpl) SignalContainer(arg0 context.Context, arg1 *oci.Container, arg2 syscall.Signal) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SignalContainer", arg0, arg1, arg2)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// SignalContainer indicates an expected call of SignalContainer.
-func (mr *MockRuntimeImplMockRecorder) SignalContainer(arg0, arg1, arg2 any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SignalContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).SignalContainer), arg0, arg1, arg2)
 }
 
 // StartContainer mocks base method.

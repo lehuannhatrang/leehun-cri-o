@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"regexp"
 	"sort"
@@ -14,26 +13,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containers/common/libimage"
-	"github.com/containers/image/v5/copy"
-	"github.com/containers/image/v5/docker"
-	"github.com/containers/image/v5/docker/reference"
-	cimage "github.com/containers/image/v5/image"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/pkg/shortnames"
-	"github.com/containers/image/v5/signature"
-	istorage "github.com/containers/image/v5/storage"
-	"github.com/containers/image/v5/transports"
-	"github.com/containers/image/v5/transports/alltransports"
-	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/reexec"
-	json "github.com/json-iterator/go"
+	json "github.com/goccy/go-json"
 	"github.com/moby/sys/mountinfo"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/common/libimage"
+	"go.podman.io/image/v5/copy"
+	"go.podman.io/image/v5/docker"
+	"go.podman.io/image/v5/docker/reference"
+	cimage "go.podman.io/image/v5/image"
+	"go.podman.io/image/v5/manifest"
+	"go.podman.io/image/v5/pkg/shortnames"
+	"go.podman.io/image/v5/signature"
+	istorage "go.podman.io/image/v5/storage"
+	"go.podman.io/image/v5/transports"
+	"go.podman.io/image/v5/transports/alltransports"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/reexec"
 	crierrors "k8s.io/cri-api/pkg/errors"
 
 	"github.com/cri-o/cri-o/internal/log"
@@ -71,11 +70,6 @@ type ImageResult struct {
 	MountPoint          string
 }
 
-type indexInfo struct {
-	name   string
-	secure bool
-}
-
 // A set of information that we prefer to cache about images, so that we can
 // avoid having to reread them every time we need to return information about
 // images.
@@ -92,9 +86,7 @@ type imageCache map[string]imageCacheItem
 
 // WARNING: All of imageLookupService must be JSON-representable because it is included in pullImageArgs.
 type imageLookupService struct {
-	DefaultTransport      string
-	InsecureRegistryCIDRs []*net.IPNet
-	IndexConfigs          map[string]*indexInfo
+	DefaultTransport string
 }
 
 type imageService struct {
@@ -707,14 +699,11 @@ func formatPullImageOutputItemGoroutine(dest io.Writer, items <-chan pullImageOu
 		outputWritten <- struct{}{}
 	}()
 
-	stream := json.NewStream(json.ConfigDefault, dest, 4096)
+	encoder := json.NewEncoder(dest)
 	for item := range items {
-		stream.WriteVal(item)
-		stream.WriteRaw("\n")
-
-		if err := stream.Flush(); err != nil {
+		if err := encoder.Encode(item); err != nil {
 			fmt.Fprintf(os.Stderr, "%v", err)
-			//nolint:gocritic // “exitAfterDefer: os.Exit will exit, and `defer func(){...}(...)` will not run”
+			//nolint:gocritic // "exitAfterDefer: os.Exit will exit, and `defer func(){...}(...)` will not run"
 			// If we fail writing output, outputWritten can never really be set, and it is no longer relevant.
 			// Just abort.
 			os.Exit(1)
@@ -854,10 +843,6 @@ func pullImageImplementation(ctx context.Context, lookup *imageLookupService, st
 		srcSystemContext = *options.SourceCtx // A shallow copy
 	}
 
-	if secure := lookup.isSecureIndex(imageName.Registry()); !secure {
-		srcSystemContext.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
-	}
-
 	destRef, err := istorage.Transport.NewStoreReference(store, imageName.Raw(), "")
 	if err != nil {
 		return RegistryImageReference{}, err
@@ -881,16 +866,26 @@ func pullImageImplementation(ctx context.Context, lookup *imageLookupService, st
 		Progress:         options.Progress,
 	})
 	if err != nil {
-		artifactManifestBytes, artifactErr := ociartifact.NewStore(store.GraphRoot(), &srcSystemContext).PullManifest(ctx, srcRef, &ociartifact.PullOptions{CopyOptions: &libimage.CopyOptions{
+		artifactStore, artifactErr := ociartifact.NewStore(store.GraphRoot(), &srcSystemContext)
+		if artifactErr != nil {
+			return RegistryImageReference{}, fmt.Errorf("unable to pull image or OCI artifact: create store err: %w", artifactErr)
+		}
+
+		artifactManifestDigest, artifactErr := artifactStore.PullManifest(ctx, srcRef, &libimage.CopyOptions{
 			OciDecryptConfig: options.OciDecryptConfig,
 			Progress:         options.Progress,
 			RemoveSignatures: true, // signature is not supported for OCI layout dest
-		}})
+		})
 		if artifactErr != nil {
 			return RegistryImageReference{}, fmt.Errorf("unable to pull image or OCI artifact: pull image err: %w; artifact err: %w", err, artifactErr)
 		}
 
-		manifestBytes = artifactManifestBytes
+		canonicalRef, err := reference.WithDigest(reference.TrimNamed(imageName.Raw()), *artifactManifestDigest)
+		if err != nil {
+			return RegistryImageReference{}, fmt.Errorf("create canonical reference: %w", err)
+		}
+
+		return references.RegistryImageReferenceFromRaw(canonicalRef), nil
 	}
 
 	manifestDigest, err := manifest.Digest(manifestBytes)
@@ -948,41 +943,6 @@ func (svc *imageService) DeleteImage(systemContext *types.SystemContext, id Stor
 
 func (svc *imageService) GetStore() storage.Store {
 	return svc.store
-}
-
-func (svc *imageLookupService) isSecureIndex(indexName string) bool {
-	if index, ok := svc.IndexConfigs[indexName]; ok {
-		return index.secure
-	}
-
-	host, _, err := net.SplitHostPort(indexName)
-	if err != nil {
-		// assume indexName is of the form `host` without the port and go on.
-		host = indexName
-	}
-
-	addrs, err := net.LookupIP(host)
-	if err != nil {
-		ip := net.ParseIP(host)
-		// if ip == nil, then `host` is neither an IP nor it could be looked up,
-		// either because the index is unreachable, or because the index is behind an HTTP proxy.
-		// So, len(addrs) == 0 and we're not aborting.
-		if ip != nil {
-			addrs = []net.IP{ip}
-		}
-	}
-
-	// Try CIDR notation only if addrs has any elements, i.e. if `host`'s IP could be determined.
-	for _, addr := range addrs {
-		for _, ipnet := range svc.InsecureRegistryCIDRs {
-			// check if the addr falls in the subnet
-			if ipnet.Contains(addr) {
-				return false
-			}
-		}
-	}
-
-	return true
 }
 
 // HeuristicallyTryResolvingStringAsIDPrefix checks if heuristicInput could be a valid image ID or a prefix, and returns
@@ -1063,9 +1023,7 @@ func GetImageService(ctx context.Context, store storage.Store, storageTransport 
 	}
 
 	ils := &imageLookupService{
-		DefaultTransport:      serverConfig.DefaultTransport,
-		IndexConfigs:          make(map[string]*indexInfo),
-		InsecureRegistryCIDRs: make([]*net.IPNet, 0),
+		DefaultTransport: serverConfig.DefaultTransport,
 	}
 	// add the sandbox/pause image configured by the user (if any) to the list of pinned_images.
 	if serverConfig.PauseImage != "" {
@@ -1082,25 +1040,9 @@ func GetImageService(ctx context.Context, store storage.Store, storageTransport 
 		regexForPinnedImages: CompileRegexpsForPinnedImages(serverConfig.PinnedImages),
 	}
 
+	//nolint:staticcheck // SA1019: InsecureRegistries is deprecated but still supported for backward compatibility
 	if len(serverConfig.InsecureRegistries) > 0 {
-		log.Warnf(ctx, "Insecure registries option is deprecated and will not have any effect in a future release")
-	}
-
-	serverConfig.InsecureRegistries = append(serverConfig.InsecureRegistries, "127.0.0.0/8")
-	// Split --insecure-registry into CIDR and registry-specific settings.
-	for _, r := range serverConfig.InsecureRegistries {
-		// Check if CIDR was passed to --insecure-registry
-		_, ipnet, err := net.ParseCIDR(r)
-		if err == nil {
-			// Valid CIDR.
-			is.lookup.InsecureRegistryCIDRs = append(is.lookup.InsecureRegistryCIDRs, ipnet)
-		} else {
-			// Assume `host:port` if not CIDR.
-			is.lookup.IndexConfigs[r] = &indexInfo{
-				name:   r,
-				secure: false,
-			}
-		}
+		log.Errorf(ctx, "Insecure registries option is deprecated and no longer effective. Please use `insecure` in `registries.conf` instead.")
 	}
 
 	return is, nil

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/containerd/nri/pkg/api"
 	nrigen "github.com/containerd/nri/pkg/runtime-tools/generate"
@@ -13,6 +15,7 @@ import (
 	cri "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"tags.cncf.io/container-device-interface/pkg/cdi"
 
+	"github.com/cri-o/cri-o/internal/annotations"
 	"github.com/cri-o/cri-o/internal/config/cgmgr"
 	"github.com/cri-o/cri-o/internal/config/node"
 	"github.com/cri-o/cri-o/internal/config/rdt"
@@ -20,7 +23,6 @@ import (
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/nri"
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/pkg/annotations"
 )
 
 type nriAPI struct {
@@ -115,6 +117,10 @@ func (a *nriAPI) createContainer(ctx context.Context, specgen *generate.Generato
 	adjust, err := a.nri.CreateContainer(ctx, pod, ctr)
 	if err != nil {
 		return err
+	}
+
+	if adjust == nil {
+		return nil
 	}
 
 	wrapgen := nrigen.SpecGenerator(specgen,
@@ -287,9 +293,15 @@ func (a *nriAPI) postUpdateContainer(ctx context.Context, criCtr *oci.Container)
 	return a.nri.PostUpdateContainer(ctx, pod, ctr)
 }
 
-func (a *nriAPI) stopContainer(ctx context.Context, criPod *sandbox.Sandbox, criCtr *oci.Container) error {
+func (a *nriAPI) stopContainer(ctx context.Context, criPod *sandbox.Sandbox, criCtr *oci.Container, updateState bool) error {
 	if !a.isEnabled() {
 		return nil
+	}
+
+	if updateState {
+		if err := a.cri.Runtime().UpdateContainerStatus(ctx, criCtr); err != nil {
+			log.Warnf(ctx, "Error updating the container status  %q: %v", criCtr.ID(), err)
+		}
 	}
 
 	ctr := &criContainer{
@@ -482,6 +494,7 @@ func (a *nriAPI) EvictContainer(ctx context.Context, e *api.ContainerEviction) e
 
 type criPodSandbox struct {
 	*sandbox.Sandbox
+
 	spec *rspec.Spec
 	pid  int
 }
@@ -552,9 +565,7 @@ func (p *criPodSandbox) GetAnnotations() map[string]string {
 	}
 
 	anns := map[string]string{}
-	for key, value := range p.Annotations() {
-		anns[key] = value
-	}
+	maps.Copy(anns, p.Annotations())
 
 	return anns
 }
@@ -565,9 +576,7 @@ func (p *criPodSandbox) GetLabels() map[string]string {
 	}
 
 	labels := map[string]string{}
-	for key, value := range p.Labels() {
-		labels[key] = value
-	}
+	maps.Copy(labels, p.Labels())
 
 	return labels
 }
@@ -666,21 +675,70 @@ func (c *criContainer) GetName() string {
 	return c.GetSpec().Annotations["io.kubernetes.container.name"]
 }
 
-func (c *criContainer) GetState() api.ContainerState {
-	if c.ctr != nil {
-		switch c.ctr.State().Status {
-		case oci.ContainerStateCreated:
-			return api.ContainerState_CONTAINER_CREATED
-		case oci.ContainerStatePaused:
-			return api.ContainerState_CONTAINER_PAUSED
-		case oci.ContainerStateRunning:
-			return api.ContainerState_CONTAINER_RUNNING
-		case oci.ContainerStateStopped:
-			return api.ContainerState_CONTAINER_STOPPED
+func (c *criContainer) GetStatus() *nri.ContainerStatus {
+	const (
+		// unknownReason is the exit reason when a container's exit code is not known
+		unknownReason = "Unknown"
+		// completedExitReason is the exit reason when container exits with 0.
+		completedExitReason = "Completed"
+		// errorExitReason is the exit reason when container exits with non-zero.
+		errorExitReason = "Error"
+		// oomKilledReason is the exit reason when container is killed by OOM killer.
+		oomKilledReason = "OOMKilled"
+		// seccompKilledReason is the exit reason when container is killed by seccomp.
+		seccompKilledReason = "seccomp killed"
+	)
+
+	status := &nri.ContainerStatus{
+		State:  api.ContainerState_CONTAINER_UNKNOWN,
+		Reason: unknownReason,
+	}
+
+	if c.ctr == nil {
+		return status
+	}
+
+	cState := c.ctr.State()
+
+	switch cState.Status {
+	case oci.ContainerStateCreated:
+		status.State = api.ContainerState_CONTAINER_CREATED
+		status.CreatedAt = c.ctr.CreatedAt().UnixNano()
+	case oci.ContainerStateRunning, oci.ContainerStatePaused:
+		status.State = api.ContainerState_CONTAINER_RUNNING
+		status.CreatedAt = c.ctr.CreatedAt().UnixNano()
+		status.StartedAt = cState.Started.UnixNano()
+	case oci.ContainerStateStopped:
+		status.State = api.ContainerState_CONTAINER_STOPPED
+		status.CreatedAt = c.ctr.CreatedAt().UnixNano()
+		status.StartedAt = cState.Started.UnixNano()
+		status.FinishedAt = cState.Finished.UnixNano()
+
+		if cState.ExitCode != nil {
+			status.ExitCode = *cState.ExitCode
+		}
+
+		switch {
+		case cState.OOMKilled:
+			status.Reason = oomKilledReason
+		case cState.SeccompKilled:
+			status.Reason = seccompKilledReason
+			status.Message = cState.Error
+		case cState.ExitCode != nil:
+			if status.ExitCode == 0 {
+				status.Reason = completedExitReason
+			} else {
+				status.Reason = errorExitReason
+				status.Message = cState.Error
+			}
 		}
 	}
 
-	return api.ContainerState_CONTAINER_UNKNOWN
+	if cState.InitPid > 0 {
+		status.Pid = uint32(cState.InitPid)
+	}
+
+	return status
 }
 
 func (c *criContainer) GetLabels() map[string]string {
@@ -769,6 +827,79 @@ func (c *criContainer) GetCgroupsPath() string {
 	return c.GetSpec().Linux.CgroupsPath
 }
 
+func (c *criContainer) GetIOPriority() *api.LinuxIOPriority {
+	spec := c.GetSpec()
+	if spec.Process == nil {
+		return nil
+	}
+
+	return api.FromOCILinuxIOPriority(spec.Process.IOPriority)
+}
+
+func (c *criContainer) GetScheduler() *api.LinuxScheduler {
+	spec := c.GetSpec()
+	if spec.Process == nil || spec.Process.Scheduler == nil {
+		return nil
+	}
+
+	return api.FromOCILinuxScheduler(spec.Process.Scheduler)
+}
+
+func (c *criContainer) GetNetDevices() map[string]*api.LinuxNetDevice {
+	spec := c.GetSpec()
+	if spec.Linux == nil {
+		return nil
+	}
+
+	return api.FromOCILinuxNetDevices(spec.Linux.NetDevices)
+}
+
+func (c *criContainer) GetRdt() *api.LinuxRdt {
+	spec := c.GetSpec()
+	if spec.Linux == nil || spec.Linux.IntelRdt == nil {
+		return nil
+	}
+
+	return &api.LinuxRdt{
+		ClosId:           api.String(spec.Linux.IntelRdt.ClosID),
+		Schemata:         api.RepeatedString(spec.Linux.IntelRdt.Schemata),
+		EnableMonitoring: api.Bool(spec.Linux.IntelRdt.EnableMonitoring),
+	}
+}
+
+func (c *criContainer) GetUser() *api.User {
+	spec := c.GetSpec()
+
+	if spec.Process == nil {
+		return nil
+	}
+
+	return &api.User{
+		Uid:            spec.Process.User.UID,
+		Gid:            spec.Process.User.GID,
+		AdditionalGids: slices.Clone(spec.Process.User.AdditionalGids),
+	}
+}
+
+func (c *criContainer) GetRlimits() []*api.POSIXRlimit {
+	spec := c.GetSpec()
+	if spec.Process == nil {
+		return nil
+	}
+
+	rlimits := make([]*api.POSIXRlimit, 0, len(spec.Process.Rlimits))
+
+	for _, l := range spec.Process.Rlimits {
+		rlimits = append(rlimits, &api.POSIXRlimit{
+			Type: l.Type,
+			Hard: l.Hard,
+			Soft: l.Soft,
+		})
+	}
+
+	return rlimits
+}
+
 func (c *criContainer) GetSpec() *rspec.Spec {
 	if c.spec != nil {
 		return c.spec
@@ -817,9 +948,7 @@ func fromCRILinuxResources(c *cri.LinuxContainerResources) *api.LinuxResources {
 
 	if u := c.GetUnified(); len(u) != 0 {
 		r.Unified = make(map[string]string)
-		for k, v := range u {
-			r.Unified[k] = v
-		}
+		maps.Copy(r.GetUnified(), u)
 	}
 
 	return r
@@ -854,9 +983,7 @@ func toCRIResources(r *api.LinuxResources, oomScoreAdj int64) *cri.LinuxContaine
 
 	if u := r.GetUnified(); len(u) != 0 {
 		o.Unified = make(map[string]string)
-		for k, v := range u {
-			o.Unified[k] = v
-		}
+		maps.Copy(o.GetUnified(), u)
 	}
 
 	return o

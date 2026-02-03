@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	imageTypes "github.com/containers/image/v5/types"
-	"github.com/containers/storage/pkg/idtools"
-	storageTypes "github.com/containers/storage/types"
 	"github.com/fsnotify/fsnotify"
+	imageTypes "go.podman.io/image/v5/types"
+	"go.podman.io/storage/pkg/idtools"
+	storageTypes "go.podman.io/storage/types"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -56,20 +56,24 @@ var errSandboxNotCreated = errors.New("sandbox not created")
 
 // StreamService implements streaming.Runtime.
 type StreamService struct {
+	streaming.Runtime
+
 	ctx                 context.Context
 	runtimeServer       *Server // needed by Exec() endpoint
 	streamServer        streaming.Server
 	streamServerCloseCh chan struct{}
-	streaming.Runtime
 }
 
 // Server implements the RuntimeService and ImageService.
 type Server struct {
+	*lib.ContainerServer
+	types.UnsafeImageServiceServer
+	types.UnsafeRuntimeServiceServer
+
 	config          libconfig.Config
 	stream          *StreamService
 	hostportManager hostport.HostPortManager
 
-	*lib.ContainerServer
 	monitorsChan        chan struct{}
 	defaultIDMappings   *idtools.IDMappings
 	ContainerEventsChan chan types.ContainerEventResponse
@@ -95,8 +99,7 @@ type Server struct {
 	// hooksRetriever allows getting the runtime hooks for the sandboxes.
 	hooksRetriever *runtimehandlerhooks.HooksRetriever
 
-	types.UnsafeImageServiceServer
-	types.UnsafeRuntimeServiceServer
+	artifactStore *ociartifact.Store
 }
 
 // pullArguments are used to identify a pullOperation via an input image name and
@@ -455,6 +458,11 @@ func New(
 		os.Unsetenv("DBUS_SESSION_BUS_ADDRESS")
 	}
 
+	artifactStore, err := ociartifact.NewStore(containerServer.Store().GraphRoot(), config.SystemContext)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		ContainerServer:          containerServer,
 		hostportManager:          hostportManager,
@@ -467,6 +475,7 @@ func New(
 		pullOperationsInProgress: make(map[pullArguments]*pullOperation),
 		resourceStore:            resourcestore.New(),
 		hooksRetriever:           runtimehandlerhooks.NewHooksRetriever(ctx, config),
+		artifactStore:            artifactStore,
 	}
 
 	if s.config.EnablePodEvents {
@@ -862,7 +871,6 @@ func (s *Server) handleExit(ctx context.Context, event fsnotify.Event) {
 	containerID := filepath.Base(event.Name)
 	log.Debugf(ctx, "Container or sandbox exited: %v", containerID)
 	c := s.GetContainer(ctx, containerID)
-	nriCtr := c
 	resource := "container"
 
 	var sb *sandbox.Sandbox
@@ -886,21 +894,7 @@ func (s *Server) handleExit(ctx context.Context, event fsnotify.Event) {
 
 	log.Debugf(ctx, "%s exited and found: %v", resource, containerID)
 
-	if err := s.ContainerStateToDisk(ctx, c); err != nil {
-		log.Warnf(ctx, "Unable to write %s %s state to disk: %v", resource, c.ID(), err)
-	}
-
-	if nriCtr != nil {
-		if err := s.nri.stopContainer(ctx, nil, nriCtr); err != nil {
-			log.Warnf(ctx, "NRI stop container request of %s failed: %v", nriCtr.ID(), err)
-		}
-	}
-
-	if hooks := s.hooksRetriever.Get(ctx, sb.RuntimeHandler(), sb.Annotations()); hooks != nil {
-		if err := hooks.PostStop(ctx, c, sb); err != nil {
-			log.Errorf(ctx, "Failed to run post-stop hook for container %s: %v", c.ID(), err)
-		}
-	}
+	s.postStopCleanup(ctx, c, sb, s.hooksRetriever.Get(ctx, sb.RuntimeHandler(), sb.Annotations()))
 
 	s.generateCRIEvent(ctx, c, types.ContainerEventType_CONTAINER_STOPPED_EVENT)
 
@@ -932,9 +926,9 @@ func (s *Server) getContainerStatuses(ctx context.Context, sandboxUID string) ([
 		return []*types.ContainerStatus{}, err
 	}
 
-	containerStatuses := make([]*types.ContainerStatus, len(containers.GetContainers()))
+	containerStatuses := make([]*types.ContainerStatus, 0, len(containers.GetContainers()))
 
-	for i, cc := range containers.GetContainers() {
+	for _, cc := range containers.GetContainers() {
 		containerStatusRequest := &types.ContainerStatusRequest{ContainerId: cc.GetId()}
 
 		resp, err := s.ContainerStatus(ctx, containerStatusRequest)
@@ -946,7 +940,7 @@ func (s *Server) getContainerStatuses(ctx context.Context, sandboxUID string) ([
 			return []*types.ContainerStatus{}, err
 		}
 
-		containerStatuses[i] = resp.GetStatus()
+		containerStatuses = append(containerStatuses, resp.GetStatus())
 	}
 
 	return containerStatuses, nil
@@ -960,9 +954,9 @@ func (s *Server) getContainerStatusesFromSandboxID(ctx context.Context, sandboxI
 		return []*types.ContainerStatus{}, err
 	}
 
-	containerStatuses := make([]*types.ContainerStatus, len(containers.GetContainers()))
+	containerStatuses := make([]*types.ContainerStatus, 0, len(containers.GetContainers()))
 
-	for i, cc := range containers.GetContainers() {
+	for _, cc := range containers.GetContainers() {
 		containerStatusRequest := &types.ContainerStatusRequest{ContainerId: cc.GetId(), Verbose: false}
 
 		resp, err := s.ContainerStatus(ctx, containerStatusRequest)
@@ -974,7 +968,7 @@ func (s *Server) getContainerStatusesFromSandboxID(ctx context.Context, sandboxI
 			return []*types.ContainerStatus{}, err
 		}
 
-		containerStatuses[i] = resp.GetStatus()
+		containerStatuses = append(containerStatuses, resp.GetStatus())
 	}
 
 	return containerStatuses, nil
@@ -1123,5 +1117,5 @@ func (s *Server) watchAndReloadMirrorRegistriesConfiguration(ctx context.Context
 
 // ArtifactStore returns a new artifact store instance.
 func (s *Server) ArtifactStore() *ociartifact.Store {
-	return ociartifact.NewStore(s.Store().GraphRoot(), s.Config().SystemContext)
+	return s.artifactStore
 }

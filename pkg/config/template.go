@@ -64,15 +64,19 @@ func assembleTemplateString(displayAllConfig bool, c *Config) string {
 func crioTemplateString(group templateGroup, prefix string, displayAll bool, crioTemplateConfig []*templateConfigValue) string {
 	templateString := ""
 
+	var sb strings.Builder
+
 	for _, configItem := range crioTemplateConfig {
 		if group == configItem.group {
 			if !configItem.isDefaultValue || displayAll {
-				templateString += strings.ReplaceAll(configItem.templateString, "{{ $.Comment }}", "")
+				sb.WriteString(strings.ReplaceAll(configItem.templateString, "{{ $.Comment }}", ""))
 			} else {
-				templateString += configItem.templateString
+				sb.WriteString(configItem.templateString)
 			}
 		}
 	}
+
+	templateString += sb.String()
 
 	if templateString != "" {
 		templateString = prefix + templateString
@@ -640,7 +644,7 @@ func initCrioTemplateConfig(c *Config) ([]*templateConfigValue, error) {
 		},
 		{
 			templateString: templateStringCrioStatsIncludedPodMetrics,
-			group:          crioNetworkConfig,
+			group:          crioStatsConfig,
 			isDefaultValue: slices.Equal(dc.IncludedPodMetrics, c.IncludedPodMetrics),
 		},
 		{
@@ -1257,6 +1261,7 @@ const templateStringCrioRuntimeRuntimesRuntimeHandler = `# The "crio.runtime.run
 # default_annotations = {}
 # stream_websockets = false
 # seccomp_profile = ""
+# container_create_timeout = 240
 # Where:
 # - runtime-handler: Name used to identify the runtime.
 # - runtime_path (optional, string): Absolute path to the runtime executable in
@@ -1320,6 +1325,11 @@ const templateStringCrioRuntimeRuntimesRuntimeHandler = `# The "crio.runtime.run
 #   seccomp profile for the runtime.
 #   If not specified or set to "", the runtime seccomp_profile will be used.
 #   If that is also not specified or set to "", the internal default seccomp profile will be applied.
+# - container_create_timeout (optional, int64): The timeout for container creation operations in seconds.
+#   If not set, defaults to 240 seconds. If set to a value less than 30 seconds, it will be automatically
+#   adjusted to 30 seconds (the minimum allowed value). This allows different runtime handlers to have
+#   different container creation timeouts, which is useful for VM-based runtimes that may need longer
+#   timeouts than OCI runtimes.
 #
 # Using the seccomp notifier feature:
 #
@@ -1509,7 +1519,7 @@ const templateStringCrioImageSignaturePolicyDir = `# Root path for pod namespace
 const templateStringCrioImageInsecureRegistries = `# List of registries to skip TLS verification for pulling images. Please
 # consider configuring the registries via /etc/containers/registries.conf before
 # changing them here.
-# This option is deprecated. Use registries.conf file instead.
+# This option is deprecated and no longer effective. Use registries.conf file instead.
 {{ $.Comment }}insecure_registries = [
 {{ range $opt := .InsecureRegistries }}{{ $.Comment }}{{ printf "\t%q,\n" $opt }}{{ end }}{{ $.Comment }}]
 
@@ -1656,6 +1666,7 @@ const templateStringCrioStatsCollectionPeriod = `# The number of seconds between
 `
 
 const templateStringCrioStatsIncludedPodMetrics = `# List of included pod metrics.
+# You can also specify "all" to include all available metrics. If you specify "all", it should be the only item in the list.
 {{ $.Comment }}included_pod_metrics = [
 {{ range $opt := .IncludedPodMetrics }}{{ $.Comment }}{{ printf "\t%q,\n" $opt }}{{ end }}{{ $.Comment }}]
 

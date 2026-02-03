@@ -19,13 +19,13 @@ dependencies:
         match: Version
 
   - name: supported versions
-    version: '{"1.34", "1.33", "1.32", "1.31"}'
+    version: '{"1.34", "1.33", "1.32"}'
     refPaths:
       - path: internal/version/version.go
         match: ReleaseMinorVersions
 
   - name: golangci-lint
-    version: v2.5.0
+    version: v2.6.2
     refPaths:
       - path: .github/workflows/verify.yml
         match: GOLANGCI_LINT_VERSION

@@ -18,13 +18,13 @@ import (
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
 	criu "github.com/checkpoint-restore/go-criu/v7/utils"
-	"github.com/containers/common/pkg/crutils"
 	conmonconfig "github.com/containers/conmon/runner/config"
-	"github.com/containers/storage/pkg/pools"
 	"github.com/fsnotify/fsnotify"
-	json "github.com/json-iterator/go"
+	json "github.com/goccy/go-json"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/common/pkg/crutils"
+	"go.podman.io/storage/pkg/pools"
 	"golang.org/x/sys/unix"
 	kwait "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/remotecommand"
@@ -33,6 +33,7 @@ import (
 	utilexec "k8s.io/utils/exec"
 
 	"github.com/cri-o/cri-o/internal/config/cgmgr"
+	"github.com/cri-o/cri-o/internal/lib/stats"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/cri-o/server/metrics"
@@ -101,6 +102,19 @@ type exitCodeInfo struct {
 	Message  string `json:"message,omitempty"`
 }
 
+// execCmdWrapper wraps exec.Cmd to implement the ExecStarter interface.
+type execCmdWrapper struct {
+	cmd *exec.Cmd
+}
+
+func (w *execCmdWrapper) Start() error {
+	return w.cmd.Start()
+}
+
+func (w *execCmdWrapper) GetPid() int {
+	return w.cmd.Process.Pid
+}
+
 // CreateContainer creates a container.
 func (r *runtimeOCI) CreateContainer(ctx context.Context, c *Container, cgroupParent string, restore bool) (retErr error) {
 	ctx, span := log.StartSpan(ctx)
@@ -109,6 +123,9 @@ func (r *runtimeOCI) CreateContainer(ctx context.Context, c *Container, cgroupPa
 	if c.Spoofed() {
 		return nil
 	}
+
+	// Get the container create timeout for this runtime handler
+	timeout := time.Duration(r.handler.ContainerCreateTimeout) * time.Second
 
 	var stderrBuf bytes.Buffer
 
@@ -330,8 +347,8 @@ func (r *runtimeOCI) CreateContainer(ctx context.Context, c *Container, cgroupPa
 
 			return errors.New("container create failed")
 		}
-	case <-time.After(ContainerCreateTimeout):
-		log.Errorf(ctx, "Container creation timeout (%v)", ContainerCreateTimeout)
+	case <-time.After(timeout):
+		log.Errorf(ctx, "Container creation timeout (%v)", timeout)
 
 		return errors.New("create container timeout")
 	}
@@ -478,7 +495,24 @@ func (r *runtimeOCI) ExecContainer(ctx context.Context, c *Container, cmd []stri
 	args := r.defaultRuntimeArgs()
 	args = append(args, "exec", "--process", processFile, c.ID())
 
-	execCmd := cmdrunner.CommandContext(ctx, c.RuntimePathForPlatform(r), args...) //nolint: gosec
+	var execCmd *exec.Cmd
+	// execCgroupPath is set only when ExecCPUAffinity is used.
+	if execCgroupPath := c.ExecCgroupPath(); execCgroupPath != "" {
+		// When execCgroupPath is used, we don't prepend the taskset command even if InfraCtrCPUSet is set.
+		// Otherwise, the taskset command may fail.
+		execCmd = exec.CommandContext(ctx, c.RuntimePathForPlatform(r), args...) //nolint: gosec
+
+		execCgroupFD, err := os.Open(execCgroupPath)
+		if err != nil {
+			return fmt.Errorf("failed to open exec cgroup %s: %w", execCgroupPath, err)
+		}
+		defer execCgroupFD.Close()
+
+		setSysProcAttr(execCmd, execCgroupFD.Fd())
+	} else {
+		execCmd = cmdrunner.CommandContext(ctx, c.RuntimePathForPlatform(r), args...) //nolint: gosec
+	}
+
 	if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
 		execCmd.Env = append(execCmd.Env, "XDG_RUNTIME_DIR="+v)
 	}
@@ -522,12 +556,8 @@ func (r *runtimeOCI) ExecContainer(ctx context.Context, c *Container, cmd []stri
 			execCmd.Stderr = stderr
 		}
 
-		if err := execCmd.Start(); err != nil {
-			return err
-		}
-
-		pid := execCmd.Process.Pid
-		if err := c.AddExecPID(pid, true); err != nil {
+		pid, err := c.StartExecCmd(&execCmdWrapper{cmd: execCmd}, true)
+		if err != nil {
 			return err
 		}
 		defer c.DeleteExecPID(pid)
@@ -653,7 +683,23 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 
 	var cmd *exec.Cmd
 
-	if r.handler.MonitorExecCgroup == config.MonitorExecCgroupDefault || r.config.InfraCtrCPUSet == "" { //nolint: gocritic
+	// execCgroupPath is set only when ExecCPUAffinity is used.
+	if execCgroupPath := c.ExecCgroupPath(); execCgroupPath != "" {
+		// When execCgroupPath is used, we don't prepend the taskset command even if InfraCtrCPUSet is set.
+		// Otherwise, the taskset command may fail.
+		cmd = exec.Command(r.handler.MonitorPath, args...) //nolint: gosec
+
+		execCgroupFD, err := os.Open(execCgroupPath)
+		if err != nil {
+			return nil, &ExecSyncError{
+				ExitCode: -1,
+				Err:      fmt.Errorf("failed to open exec cgroup %s: %w", execCgroupPath, err),
+			}
+		}
+		defer execCgroupFD.Close()
+
+		setSysProcAttr(cmd, execCgroupFD.Fd())
+	} else if r.handler.MonitorExecCgroup == config.MonitorExecCgroupDefault || r.config.InfraCtrCPUSet == "" { //nolint: gocritic
 		cmd = cmdrunner.Command(r.handler.MonitorPath, args...) //nolint: gosec
 	} else if r.handler.MonitorExecCgroup == config.MonitorExecCgroupContainer {
 		cmd = exec.Command(r.handler.MonitorPath, args...) //nolint: gosec
@@ -674,7 +720,7 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 	cmd.ExtraFiles = append(cmd.ExtraFiles, childPipe, childStartPipe)
 	r.prepareEnv(cmd, true)
 
-	err = cmd.Start()
+	pid, err := c.StartExecCmd(&execCmdWrapper{cmd: cmd}, false)
 	if err != nil {
 		childPipe.Close()
 		childStartPipe.Close()
@@ -709,14 +755,10 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 				if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != -1 {
 					retErr = fmt.Errorf("failed to wait %w after failing with: %w", waitErr, retErr)
 				}
+				// Clean up the PID registration since the exec failed
+				c.DeleteExecPID(pid)
 			}
 		}()
-
-		// A neat trick we can do is register the exec PID before we send info down the start pipe.
-		// Doing so guarantees we can short circuit the exec process if the container is stopping already.
-		if err := c.AddExecPID(cmd.Process.Pid, false); err != nil {
-			return err
-		}
 
 		if r.handler.MonitorExecCgroup == config.MonitorExecCgroupContainer && r.config.InfraCtrCPUSet != "" {
 			// Update the exec's cgroup
@@ -725,7 +767,7 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 				return err
 			}
 
-			err = cgmgr.MoveProcessToContainerCgroup(containerPid, cmd.Process.Pid)
+			err = cgmgr.MoveProcessToContainerCgroup(containerPid, pid)
 			if err != nil {
 				return err
 			}
@@ -747,9 +789,6 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 			Err:      err,
 		}
 	}
-
-	// defer in case the Pid is changed after Wait()
-	pid := cmd.Process.Pid
 
 	// first, wait till the command is done
 	waitErr := cmd.Wait()
@@ -1272,7 +1311,7 @@ func (r *runtimeOCI) UnpauseContainer(ctx context.Context, c *Container) error {
 }
 
 // ContainerStats provides statistics of a container.
-func (r *runtimeOCI) ContainerStats(ctx context.Context, c *Container, cgroup string) (*cgmgr.CgroupStats, error) {
+func (r *runtimeOCI) CgroupStats(ctx context.Context, c *Container, cgroup string) (*stats.CgroupStats, error) {
 	_, span := log.StartSpan(ctx)
 	defer span.End()
 
@@ -1282,23 +1321,22 @@ func (r *runtimeOCI) ContainerStats(ctx context.Context, c *Container, cgroup st
 	return r.config.CgroupManager().ContainerCgroupStats(cgroup, c.ID())
 }
 
-// SignalContainer sends a signal to a container process.
-func (r *runtimeOCI) SignalContainer(ctx context.Context, c *Container, sig syscall.Signal) error {
+// DiskStats provides disk usage statistics of a container.
+func (r *runtimeOCI) DiskStats(ctx context.Context, c *Container, cgroup string) (*stats.DiskStats, error) {
 	_, span := log.StartSpan(ctx)
 	defer span.End()
 
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
 
-	if c.Spoofed() {
-		return nil
+	// Get disk usage from the container's mount point
+	mountPoint := c.MountPoint()
+	if mountPoint == "" {
+		return nil, fmt.Errorf("container %s has no mount point", c.ID())
 	}
 
-	if unix.SignalName(sig) == "" {
-		return fmt.Errorf("unable to find signal %s", sig.String())
-	}
-
-	return r.signalContainer(c, sig, false)
+	// Get disk usage statistics directly
+	return stats.GetDiskUsageForPath(mountPoint)
 }
 
 func (r *runtimeOCI) signalContainer(c *Container, sig syscall.Signal, all bool) error {

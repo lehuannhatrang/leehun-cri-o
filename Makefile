@@ -49,7 +49,7 @@ GO_MD2MAN ?= ${BUILD_BIN_PATH}/go-md2man
 GINKGO := ${BUILD_BIN_PATH}/ginkgo
 MOCKGEN := ${BUILD_BIN_PATH}/mockgen
 GOLANGCI_LINT := ${BUILD_BIN_PATH}/golangci-lint
-GOLANGCI_LINT_VERSION := v2.5.0
+GOLANGCI_LINT_VERSION := v2.6.2
 GO_MOD_OUTDATED := ${BUILD_BIN_PATH}/go-mod-outdated
 GO_MOD_OUTDATED_VERSION := 0.9.0
 GOSEC := ${BUILD_BIN_PATH}/gosec
@@ -314,7 +314,7 @@ uninstall: ## Uninstall all files.
 ##@ Verify targets:
 
 .PHONY: lint
-lint:  ${GOLANGCI_LINT} ## Run the golang linter, supposed to not run on CI.
+lint: ${GOLANGCI_LINT} ## Run the golang linter, supposed to not run on CI.
 	${GOLANGCI_LINT} version
 	${GOLANGCI_LINT} linters
 	GL_DEBUG=gocritic ${GOLANGCI_LINT} run --fix
@@ -448,7 +448,8 @@ mockgen: \
 	mock-ocicni-types \
 	mock-seccompociartifact-types \
 	mock-ociartifact-types \
-	mock-systemd
+	mock-systemd \
+	mock-cgmgr
 
 .PHONY: mock-containereventserver
 mock-containereventserver: ${MOCKGEN}
@@ -462,7 +463,7 @@ mock-containerstorage: ${MOCKGEN}
 	${MOCKGEN} \
 		-package containerstoragemock \
 		-destination ${MOCK_PATH}/containerstorage/containerstorage.go \
-		github.com/containers/storage Store
+		go.podman.io/storage Store
 
 .PHONY: mock-cmdrunner
 mock-cmdrunner: ${MOCKGEN}
@@ -492,12 +493,19 @@ mock-oci: ${MOCKGEN}
 		-destination ${MOCK_PATH}/oci/oci.go \
 		github.com/cri-o/cri-o/internal/oci RuntimeImpl
 
+.PHONY: mock-cgmgr
+mock-cgmgr: ${MOCKGEN}
+	${MOCKGEN} \
+		-package cgmgr \
+		-destination ${MOCK_PATH}/config/cgmgr/cgmgr.go \
+		github.com/cri-o/cri-o/internal/config/cgmgr CgroupManager
+
 .PHONY: mock-image-types
 mock-image-types: ${MOCKGEN}
 	${BUILD_BIN_PATH}/mockgen \
 		-package imagetypesmock \
 		-destination ${MOCK_PATH}/containers/image/v5/types.go \
-		github.com/containers/image/v5/types ImageCloser
+		go.podman.io/image/v5/types ImageCloser
 
 .PHONY: mock-ocicni-types
 mock-ocicni-types: ${MOCKGEN}
@@ -518,7 +526,7 @@ mock-ociartifact-types: ${MOCKGEN}
 	${BUILD_BIN_PATH}/mockgen \
 		-package ociartifactmock \
 		-destination ${MOCK_PATH}/ociartifact/ociartifact.go \
-		github.com/cri-o/cri-o/internal/ociartifact Impl
+		github.com/cri-o/cri-o/internal/ociartifact Impl,LibartifactStore
 
 .PHONY: mock-systemd
 mock-systemd: ${MOCKGEN}

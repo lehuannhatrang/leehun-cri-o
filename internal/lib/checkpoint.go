@@ -10,14 +10,14 @@ import (
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
 	"github.com/checkpoint-restore/go-criu/v7/stats"
-	"github.com/containers/common/pkg/crutils"
-	"github.com/containers/storage/pkg/archive"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
+	"go.podman.io/common/pkg/crutils"
+	"go.podman.io/storage/pkg/archive"
 
+	"github.com/cri-o/cri-o/internal/annotations"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/pkg/annotations"
 )
 
 // ContainerCheckpointOptions is the relevant subset of libpod.ContainerCheckpointOptions.
@@ -93,6 +93,11 @@ func (c *ContainerServer) ContainerCheckpoint(
 	}
 
 	if err := c.runtime.CheckpointContainer(ctx, ctr, specgen.Config, opts.KeepRunning); err != nil {
+		// in the case of an error, clean up any leftover CRIU images
+		if err := os.RemoveAll(ctr.CheckpointPath()); err != nil {
+			log.Warnf(ctx, "Unable to remove checkpoint directory %s: %v", ctr.CheckpointPath(), err)
+		}
+
 		return "", fmt.Errorf("failed to checkpoint container %s: %w", ctr.ID(), err)
 	}
 

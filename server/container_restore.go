@@ -10,11 +10,11 @@ import (
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
 
+	"github.com/cri-o/cri-o/internal/annotations"
 	"github.com/cri-o/cri-o/internal/factory/container"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/storage"
-	"github.com/cri-o/cri-o/pkg/annotations"
 )
 
 // checkIfCheckpointOCIImage checks if the input refers to a checkpoint image.
