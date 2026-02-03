@@ -967,3 +967,423 @@ func (s *Server) CRImportCheckpoint(
 
 	return ctr.ID(), nil
 }
+
+// CRImportCheckpointFromPath restores a container from a checkpoint tar file path
+// while using the container's image as the rootfs (instead of a checkpoint image).
+// This allows restoring checkpoints without building a checkpoint image first.
+// The checkpoint tar file should contain the CRIU checkpoint data (config.dump, spec.dump,
+// checkpoint directory, etc.) but the rootfs will be taken from the container's image.
+// The checkpointPath can be:
+//   - A local file path (e.g., /var/lib/kubelet/checkpoints/checkpoint.tar)
+//   - An S3/MinIO URL (e.g., s3://bucket/path/checkpoint.tar)
+//   - A GCS URL (e.g., gs://bucket/path/checkpoint.tar)
+//   - An HTTP/HTTPS URL (e.g., https://storage.example.com/checkpoint.tar)
+func (s *Server) CRImportCheckpointFromPath(
+	ctx context.Context,
+	createConfig *types.ContainerConfig,
+	sb *sandbox.Sandbox,
+	sandboxUID string,
+	checkpointPath string,
+) (ctrID string, retErr error) {
+	// Ensure that the image to use as rootfs has been provided.
+	if createConfig.GetImage() == nil || createConfig.GetImage().GetImage() == "" {
+		return "", errors.New(`attribute "image" missing from container definition`)
+	}
+
+	if createConfig.GetMetadata() == nil || createConfig.GetMetadata().GetName() == "" {
+		return "", errors.New(`attribute "metadata" missing from container definition`)
+	}
+
+	// The image specified in the container config is the rootfs image, not a checkpoint image
+	rootFSImage := createConfig.GetImage().GetImage()
+	createMounts := createConfig.GetMounts()
+	createAnnotations := createConfig.GetAnnotations()
+	createLabels := createConfig.GetLabels()
+
+	log.Infof(ctx, "Restoring container from checkpoint path %s with rootfs image %s", checkpointPath, rootFSImage)
+
+	// Handle remote storage - download checkpoint if it's not a local file
+	actualCheckpointPath := checkpointPath
+	if IsRemoteStorage(checkpointPath) {
+		log.Infof(ctx, "Checkpoint path is remote storage, downloading...")
+		// Use container name and sandbox ID to create a unique download path
+		containerName := createConfig.GetMetadata().GetName()
+		uniqueID := fmt.Sprintf("%s-%s", sb.ID()[:12], containerName)
+		downloadedPath, err := DownloadCheckpointFromRemote(ctx, checkpointPath, uniqueID)
+		if err != nil {
+			return "", fmt.Errorf("failed to download checkpoint from remote storage: %w", err)
+		}
+		actualCheckpointPath = downloadedPath
+		log.Infof(ctx, "Using downloaded checkpoint at %s", actualCheckpointPath)
+	}
+
+	// Extract checkpoint metadata from the tar file to a temporary directory
+	archiveFile, err := os.Open(actualCheckpointPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open checkpoint archive %s for import: %w", actualCheckpointPath, err)
+	}
+	defer func(f *os.File) {
+		if err := f.Close(); err != nil {
+			log.Errorf(ctx, "Unable to close file %s: %q", f.Name(), err)
+		}
+	}(archiveFile)
+
+	options := &archive.TarOptions{
+		// Here we only need the files config.dump and spec.dump
+		ExcludePatterns: []string{
+			"artifacts",
+			"ctr.log",
+			metadata.RootFsDiffTar,
+			metadata.NetworkStatusFile,
+			metadata.DeletedFilesFile,
+			metadata.CheckpointDirectory,
+		},
+	}
+
+	mountPoint, err := os.MkdirTemp("", "checkpoint-from-path")
+	if err != nil {
+		return "", err
+	}
+
+	defer func() {
+		if err := os.RemoveAll(mountPoint); err != nil {
+			log.Errorf(ctx, "Could not recursively remove %s: %q", mountPoint, err)
+		}
+	}()
+
+	err = archive.Untar(archiveFile, mountPoint, options)
+	if err != nil {
+		return "", fmt.Errorf("unpacking of checkpoint archive %s failed: %w", checkpointPath, err)
+	}
+
+	log.Debugf(ctx, "Unpacked checkpoint metadata from %s in %s", checkpointPath, mountPoint)
+
+	// Load spec.dump from temporary directory
+	dumpSpec := new(spec.Spec)
+	if _, err := metadata.ReadJSONFile(dumpSpec, mountPoint, metadata.SpecDumpFile); err != nil {
+		return "", fmt.Errorf("failed to read %q: %w", metadata.SpecDumpFile, err)
+	}
+
+	// Load config.dump from temporary directory
+	config := new(metadata.ContainerConfig)
+	if _, err := metadata.ReadJSONFile(config, mountPoint, metadata.ConfigDumpFile); err != nil {
+		return "", fmt.Errorf("failed to read %q: %w", metadata.ConfigDumpFile, err)
+	}
+
+	originalAnnotations := make(map[string]string)
+
+	if dumpSpec.Annotations != nil {
+		if annotationsJSON, ok := dumpSpec.Annotations[annotations.Annotations]; ok {
+			if err := json.Unmarshal([]byte(annotationsJSON), &originalAnnotations); err != nil {
+				return "", fmt.Errorf("failed to read %q: %w", annotations.Annotations, err)
+			}
+		}
+	}
+
+	if sandboxUID != "" {
+		if _, ok := originalAnnotations[kubetypes.KubernetesPodUIDLabel]; ok {
+			originalAnnotations[kubetypes.KubernetesPodUIDLabel] = sandboxUID
+		}
+	}
+
+	if createAnnotations != nil {
+		// The hash also needs to be updated or Kubernetes thinks the container needs to be restarted
+		_, ok1 := createAnnotations["io.kubernetes.container.hash"]
+		_, ok2 := originalAnnotations["io.kubernetes.container.hash"]
+
+		if ok1 && ok2 {
+			originalAnnotations["io.kubernetes.container.hash"] = createAnnotations["io.kubernetes.container.hash"]
+		}
+	}
+
+	stopMutex := sb.StopMutex()
+
+	stopMutex.RLock()
+	defer stopMutex.RUnlock()
+
+	if sb.Stopped() {
+		return "", fmt.Errorf("CreateContainer failed as the sandbox was stopped: %s", sb.ID())
+	}
+
+	ctr, err := container.New()
+	if err != nil {
+		return "", fmt.Errorf("failed to create container: %w", err)
+	}
+
+	// Use the image from the container config as rootfs (not from checkpoint)
+	containerConfig := &types.ContainerConfig{
+		Metadata: &types.ContainerMetadata{
+			Name:    createConfig.GetMetadata().GetName(),
+			Attempt: createConfig.GetMetadata().GetAttempt(),
+		},
+		Image: &types.ImageSpec{
+			Image: rootFSImage,
+		},
+		Linux: &types.LinuxContainerConfig{
+			Resources:       &types.LinuxContainerResources{},
+			SecurityContext: &types.LinuxContainerSecurityContext{},
+		},
+		Annotations: originalAnnotations,
+		Labels:      createLabels,
+	}
+
+	// Reuse CDI devices requested for this restore so that GPU and other
+	// CDI-managed devices are injected from the current node's CDI specs
+	if len(createConfig.GetCDIDevices()) > 0 {
+		containerConfig.CDIDevices = createConfig.GetCDIDevices()
+	}
+
+	if createConfig.GetLinux() != nil {
+		if createConfig.GetLinux().GetResources() != nil {
+			containerConfig.Linux.Resources = createConfig.GetLinux().GetResources()
+		}
+
+		if createConfig.GetLinux().GetSecurityContext() != nil {
+			containerConfig.Linux.SecurityContext = createConfig.GetLinux().GetSecurityContext()
+		}
+	}
+
+	if dumpSpec.Linux != nil {
+		if dumpSpec.Linux.MaskedPaths != nil {
+			containerConfig.Linux.SecurityContext.MaskedPaths = dumpSpec.Linux.MaskedPaths
+		}
+
+		if dumpSpec.Linux.ReadonlyPaths != nil {
+			containerConfig.Linux.SecurityContext.ReadonlyPaths = dumpSpec.Linux.ReadonlyPaths
+		}
+
+		if dumpSpec.Linux.Devices != nil {
+			for _, d := range dumpSpec.Linux.Devices {
+				if strings.HasPrefix(d.Path, "/dev/nvidia") {
+					continue
+				}
+
+				device := &types.Device{
+					ContainerPath: d.Path,
+					HostPath:      d.Path,
+					Permissions:   "rw",
+				}
+
+				containerConfig.Devices = append(containerConfig.Devices, device)
+			}
+		}
+	}
+
+	ignoreMounts := map[string]bool{
+		"/proc":              true,
+		"/dev":               true,
+		"/dev/pts":           true,
+		"/dev/mqueue":        true,
+		"/sys":               true,
+		"/sys/fs/cgroup":     true,
+		"/dev/shm":           true,
+		"/etc/resolv.conf":   true,
+		"/etc/hostname":      true,
+		"/run/secrets":       true,
+		"/run/.containerenv": true,
+	}
+
+	// Detect available NVIDIA drivers on the current node for mount mapping
+	nvidiaDriverInfo, err := detectNVIDIADrivers(ctx)
+	if err != nil {
+		log.Warnf(ctx, "Failed to detect NVIDIA drivers: %v", err)
+		nvidiaDriverInfo = &NVIDIADriverInfo{
+			LibraryPaths: make(map[string]string),
+			BinaryPaths:  make(map[string]string),
+		}
+	}
+
+	if len(nvidiaDriverInfo.LibraryPaths) > 0 || len(nvidiaDriverInfo.BinaryPaths) > 0 {
+		log.Infof(ctx, "Detected NVIDIA drivers on restore node - version: %s, libraries: %d, binaries: %d",
+			nvidiaDriverInfo.DriverVersion, len(nvidiaDriverInfo.LibraryPaths), len(nvidiaDriverInfo.BinaryPaths))
+	}
+
+	missingMount := []string{}
+	nvidiaAutoMounts := []spec.Mount{}
+	nvidiaMapping := make(map[string]string)
+
+	for _, m := range dumpSpec.Mounts {
+		if ignoreMounts[m.Destination] {
+			continue
+		}
+
+		// Check if this is an NVIDIA mount and handle it specially
+		if IsNVIDIAMount(m.Destination) {
+			log.Debugf(ctx, "Detected NVIDIA mount from checkpoint: %s -> %s", m.Source, m.Destination)
+
+			checkDriverCompatibility(ctx, m.Source, nvidiaDriverInfo.DriverVersion)
+
+			nodePath, mapped := mapNVIDIAMountPath(ctx, m.Source, nvidiaDriverInfo)
+			if !mapped {
+				if _, err := os.Stat(m.Source); err == nil {
+					nodePath = m.Source
+					log.Debugf(ctx, "Using original NVIDIA path as-is: %s", m.Source)
+				} else {
+					log.Warnf(ctx, "Could not map NVIDIA mount %s to current node, skipping (error: %v)", m.Source, err)
+					continue
+				}
+			}
+
+			if stat, err := os.Stat(nodePath); err == nil {
+				if m.Type == "bind" || m.Type == "" {
+					if stat.IsDir() {
+						log.Debugf(ctx, "NVIDIA mount source %s is a directory", nodePath)
+					} else {
+						log.Debugf(ctx, "NVIDIA mount source %s is a file", nodePath)
+					}
+				}
+
+				mappedMount := m
+				mappedMount.Source = nodePath
+				nvidiaAutoMounts = append(nvidiaAutoMounts, mappedMount)
+				nvidiaMapping[m.Source] = nodePath
+
+				nvidiaMount := createNVIDIAMount(mappedMount)
+				log.Debugf(ctx, "Auto-adding mapped NVIDIA mount: %#v", nvidiaMount)
+				containerConfig.Mounts = append(containerConfig.Mounts, nvidiaMount)
+				continue
+			} else {
+				log.Warnf(ctx, "Mapped NVIDIA mount source %s does not exist on host (error: %v), skipping", nodePath, err)
+				continue
+			}
+		}
+
+		mount := &types.Mount{
+			ContainerPath: m.Destination,
+		}
+
+		bindMountFound := false
+
+		for _, createMount := range createMounts {
+			if createMount.GetContainerPath() != m.Destination {
+				continue
+			}
+
+			bindMountFound = true
+			mount.HostPath = createMount.GetHostPath()
+			mount.Readonly = createMount.GetReadonly()
+			mount.RecursiveReadOnly = createMount.GetRecursiveReadOnly()
+			mount.Propagation = createMount.GetPropagation()
+
+			break
+		}
+
+		if !bindMountFound {
+			missingMount = append(missingMount, m.Destination)
+			continue
+		}
+
+		log.Debugf(ctx, "Adding mounts %#v", mount)
+		containerConfig.Mounts = append(containerConfig.Mounts, mount)
+	}
+
+	if len(missingMount) > 0 {
+		unsafeMounts := []string{}
+		for _, mount := range missingMount {
+			if isNVIDIASystemPath(mount) {
+				log.Debugf(ctx, "Skipping NVIDIA system mount: %s", mount)
+				continue
+			}
+			unsafeMounts = append(unsafeMounts, mount)
+		}
+
+		if len(unsafeMounts) > 0 {
+			log.Warnf(ctx, "Missing bind mounts during restore from path: %s", strings.Join(unsafeMounts, ","))
+		} else {
+			log.Infof(ctx, "Skipped %d system mount paths during restore from path", len(missingMount))
+		}
+	}
+
+	if len(nvidiaAutoMounts) > 0 {
+		log.Infof(ctx, "Auto-detected and mounted %d NVIDIA paths during restore from path", len(nvidiaAutoMounts))
+	}
+
+	sandboxConfig := &types.PodSandboxConfig{
+		Metadata: &types.PodSandboxMetadata{
+			Name:      sb.Metadata().GetName(),
+			Uid:       sb.Metadata().GetUid(),
+			Namespace: sb.Metadata().GetNamespace(),
+			Attempt:   sb.Metadata().GetAttempt(),
+		},
+		Linux: &types.LinuxPodSandboxConfig{},
+	}
+
+	if err := ctr.SetConfig(containerConfig, sandboxConfig); err != nil {
+		return "", fmt.Errorf("setting container config: %w", err)
+	}
+
+	if err := ctr.SetNameAndID(""); err != nil {
+		return "", fmt.Errorf("setting container name and ID: %w", err)
+	}
+
+	if _, err = s.ReserveContainerName(ctr.ID(), ctr.Name()); err != nil {
+		return "", fmt.Errorf("kubelet may be retrying requests that are timing out in CRI-O due to system load: %w", err)
+	}
+
+	defer func() {
+		if retErr != nil {
+			log.Infof(ctx, "RestoreCtr: releasing container name %s", ctr.Name())
+			s.ReleaseContainerName(ctx, ctr.Name())
+		}
+	}()
+
+	ctr.SetRestore(true)
+
+	newContainer, err := s.createSandboxContainer(ctx, ctr, sb)
+	if err != nil {
+		return "", err
+	}
+
+	defer func() {
+		if retErr != nil {
+			log.Infof(ctx, "RestoreCtr: deleting container %s from storage", ctr.ID())
+
+			err2 := s.ContainerServer.StorageRuntimeServer().DeleteContainer(ctx, ctr.ID())
+			if err2 != nil {
+				log.Warnf(ctx, "Failed to cleanup container directory: %v", err2)
+			}
+		}
+	}()
+
+	s.addContainer(ctx, newContainer)
+
+	defer func() {
+		if retErr != nil {
+			log.Infof(ctx, "RestoreCtr: removing container %s", newContainer.ID())
+			s.removeContainer(ctx, newContainer)
+		}
+	}()
+
+	if err := s.ContainerServer.CtrIDIndex().Add(ctr.ID()); err != nil {
+		return "", err
+	}
+
+	defer func() {
+		if retErr != nil {
+			log.Infof(ctx, "RestoreCtr: deleting container ID %s from idIndex", ctr.ID())
+
+			if err := s.ContainerServer.CtrIDIndex().Delete(ctr.ID()); err != nil {
+				log.Warnf(ctx, "Couldn't delete ctr id %s from idIndex", ctr.ID())
+			}
+		}
+	}()
+
+	newContainer.SetCreated()
+	newContainer.SetRestore(true)
+	// Set the restore archive path so the actual restore process can find the checkpoint data
+	// Use actualCheckpointPath which is the local path (either original or downloaded)
+	newContainer.SetRestoreArchivePath(actualCheckpointPath)
+	// No storage image ID since we're using a file path
+	newContainer.SetRestoreStorageImageID(nil)
+	newContainer.SetCheckpointedAt(config.CheckpointedAt)
+
+	log.Infof(ctx, "Successfully prepared container %s for restore from checkpoint path %s", ctr.ID(), checkpointPath)
+
+	if isContextError(ctx.Err()) {
+		log.Infof(ctx, "RestoreCtr: context was either canceled or the deadline was exceeded: %v", ctx.Err())
+
+		return "", ctx.Err()
+	}
+
+	return ctr.ID(), nil
+}

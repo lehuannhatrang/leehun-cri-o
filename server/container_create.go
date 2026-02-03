@@ -46,6 +46,16 @@ import (
 // sync with https://github.com/containers/storage/blob/7fe03f6c765f2adbc75a5691a1fb4f19e56e7071/pkg/truncindex/truncindex.go#L92
 const noSuchID = "no such id"
 
+// isRemoteCheckpointPath checks if the checkpoint path is a remote URL (S3, GCS, HTTP/HTTPS)
+func isRemoteCheckpointPath(path string) bool {
+	lowerPath := strings.ToLower(path)
+	return strings.HasPrefix(lowerPath, "s3://") ||
+		strings.HasPrefix(lowerPath, "minio://") ||
+		strings.HasPrefix(lowerPath, "gs://") ||
+		strings.HasPrefix(lowerPath, "http://") ||
+		strings.HasPrefix(lowerPath, "https://")
+}
+
 type orderedMounts []rspec.Mount
 
 // Len returns the number of mounts. Used in sorting.
@@ -435,6 +445,53 @@ func (s *Server) CreateContainer(ctx context.Context, req *types.CreateContainer
 		}
 
 		return nil, fmt.Errorf("specified sandbox not found: %s: %w", req.GetPodSandboxId(), err)
+	}
+
+	// Check if there's a checkpoint restore path annotation on the pod.
+	// This allows restoring a container from a checkpoint tar file while using
+	// the container's image as the rootfs (instead of a checkpoint image).
+	// The annotation should be specified per container:
+	//   checkpoint-restore.crio.io/<container-name>: "/path/to/checkpoint.tar"
+	containerName := req.GetConfig().GetMetadata().GetName()
+	checkpointRestorePath := ""
+	if s.config.CheckpointRestore() {
+		// Check for container-specific annotation: checkpoint-restore.crio.io/<container-name>
+		containerSpecificAnnotation := crioann.CheckpointRestoreFromPathAnnotation + "/" + containerName
+		if path, ok := sb.Annotations()[containerSpecificAnnotation]; ok && path != "" {
+			checkpointRestorePath = path
+			log.Infof(ctx, "Found checkpoint restore path annotation for container %s: %s", containerName, checkpointRestorePath)
+		}
+	}
+
+	if checkpointRestorePath != "" {
+		// For local files, validate that the checkpoint file exists
+		// Remote URLs (s3://, gs://, http://, https://) will be downloaded by CRImportCheckpointFromPath
+		if !isRemoteCheckpointPath(checkpointRestorePath) {
+			if _, err := os.Stat(checkpointRestorePath); err != nil {
+				return nil, fmt.Errorf("checkpoint restore path %q does not exist or is not accessible: %w", checkpointRestorePath, err)
+			}
+		}
+
+		log.Infof(ctx, "Restoring container %s from checkpoint file %s with rootfs from image %s",
+			containerName, checkpointRestorePath, req.GetConfig().GetImage().GetImage())
+
+		// Use the new restore from path function
+		ctrID, err := s.CRImportCheckpointFromPath(
+			ctx,
+			req.GetConfig(),
+			sb,
+			req.GetSandboxConfig().GetMetadata().GetUid(),
+			checkpointRestorePath,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		log.Debugf(ctx, "Prepared %s for restore from path\n", ctrID)
+
+		return &types.CreateContainerResponse{
+			ContainerId: ctrID,
+		}, nil
 	}
 
 	if checkpointImage {
