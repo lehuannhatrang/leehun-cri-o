@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +13,14 @@ import (
 	"strings"
 	"time"
 
+	metadata "github.com/checkpoint-restore/checkpointctl/lib"
+	"github.com/containers/storage/pkg/archive"
+	spec "github.com/opencontainers/runtime-spec/specs-go"
+	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+	kubetypes "k8s.io/kubelet/pkg/types"
+
 	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/pkg/annotations"
 )
 
 // RemoteStorageType represents the type of remote storage for checkpoint files
@@ -287,4 +295,287 @@ func downloadFromHTTP(ctx context.Context, httpURL, destPath string) error {
 
 	log.Debugf(ctx, "Successfully downloaded %d bytes from HTTP/HTTPS", written)
 	return nil
+}
+
+// =============================================================================
+// Restore Helper Functions
+// =============================================================================
+
+// restoreConfig holds parsed checkpoint configuration
+type restoreConfig struct {
+	dumpSpec            *spec.Spec
+	containerConfig     *metadata.ContainerConfig
+	originalAnnotations map[string]string
+	mountPoint          string
+}
+
+// ignoredMounts contains mount paths to ignore during restore
+var ignoredMounts = map[string]bool{
+	"/proc":              true,
+	"/dev":               true,
+	"/dev/pts":           true,
+	"/dev/mqueue":        true,
+	"/sys":               true,
+	"/sys/fs/cgroup":     true,
+	"/dev/shm":           true,
+	"/etc/resolv.conf":   true,
+	"/etc/hostname":      true,
+	"/run/secrets":       true,
+	"/run/.containerenv": true,
+}
+
+// tarExcludePatterns defines files to exclude when extracting checkpoint metadata
+var tarExcludePatterns = []string{
+	"artifacts",
+	"ctr.log",
+	metadata.RootFsDiffTar,
+	metadata.NetworkStatusFile,
+	metadata.DeletedFilesFile,
+	metadata.CheckpointDirectory,
+}
+
+// parseCheckpointMetadata loads checkpoint metadata from a mount point
+func parseCheckpointMetadata(ctx context.Context, mountPoint string) (*restoreConfig, error) {
+	dumpSpec := new(spec.Spec)
+	if _, err := metadata.ReadJSONFile(dumpSpec, mountPoint, metadata.SpecDumpFile); err != nil {
+		return nil, fmt.Errorf("failed to read %q: %w", metadata.SpecDumpFile, err)
+	}
+
+	config := new(metadata.ContainerConfig)
+	if _, err := metadata.ReadJSONFile(config, mountPoint, metadata.ConfigDumpFile); err != nil {
+		return nil, fmt.Errorf("failed to read %q: %w", metadata.ConfigDumpFile, err)
+	}
+
+	originalAnnotations := make(map[string]string)
+	if dumpSpec.Annotations != nil {
+		if annotationsJSON, ok := dumpSpec.Annotations[annotations.Annotations]; ok && annotationsJSON != "" {
+			if err := json.Unmarshal([]byte(annotationsJSON), &originalAnnotations); err != nil {
+				return nil, fmt.Errorf("failed to parse annotations: %w", err)
+			}
+		}
+	}
+
+	return &restoreConfig{
+		dumpSpec:            dumpSpec,
+		containerConfig:     config,
+		originalAnnotations: originalAnnotations,
+		mountPoint:          mountPoint,
+	}, nil
+}
+
+// updateAnnotations updates original annotations with sandbox UID and container hash
+func updateAnnotations(originalAnnotations map[string]string, sandboxUID string, createAnnotations map[string]string) {
+	if sandboxUID != "" {
+		if _, ok := originalAnnotations[kubetypes.KubernetesPodUIDLabel]; ok {
+			originalAnnotations[kubetypes.KubernetesPodUIDLabel] = sandboxUID
+		}
+	}
+
+	if createAnnotations != nil {
+		_, ok1 := createAnnotations["io.kubernetes.container.hash"]
+		_, ok2 := originalAnnotations["io.kubernetes.container.hash"]
+		if ok1 && ok2 {
+			originalAnnotations["io.kubernetes.container.hash"] = createAnnotations["io.kubernetes.container.hash"]
+		}
+	}
+}
+
+// buildContainerConfig creates a container config for restore
+func buildContainerConfig(
+	createConfig *types.ContainerConfig,
+	dumpSpec *spec.Spec,
+	originalAnnotations map[string]string,
+	rootFSImage string,
+) *types.ContainerConfig {
+	containerConfig := &types.ContainerConfig{
+		Metadata: &types.ContainerMetadata{
+			Name:    createConfig.GetMetadata().GetName(),
+			Attempt: createConfig.GetMetadata().GetAttempt(),
+		},
+		Image: &types.ImageSpec{Image: rootFSImage},
+		Linux: &types.LinuxContainerConfig{
+			Resources:       &types.LinuxContainerResources{},
+			SecurityContext: &types.LinuxContainerSecurityContext{},
+		},
+		Annotations: originalAnnotations,
+		Labels:      createConfig.GetLabels(),
+	}
+
+	// Reuse CDI devices
+	if len(createConfig.GetCDIDevices()) > 0 {
+		containerConfig.CDIDevices = createConfig.GetCDIDevices()
+	}
+
+	// Copy Linux config
+	if createConfig.GetLinux() != nil {
+		if createConfig.GetLinux().GetResources() != nil {
+			containerConfig.Linux.Resources = createConfig.GetLinux().GetResources()
+		}
+		if createConfig.GetLinux().GetSecurityContext() != nil {
+			containerConfig.Linux.SecurityContext = createConfig.GetLinux().GetSecurityContext()
+		}
+	}
+
+	// Apply dumpSpec Linux settings
+	if dumpSpec.Linux != nil {
+		if dumpSpec.Linux.MaskedPaths != nil {
+			containerConfig.Linux.SecurityContext.MaskedPaths = dumpSpec.Linux.MaskedPaths
+		}
+		if dumpSpec.Linux.ReadonlyPaths != nil {
+			containerConfig.Linux.SecurityContext.ReadonlyPaths = dumpSpec.Linux.ReadonlyPaths
+		}
+		// Add devices (skip NVIDIA devices - handled by CDI)
+		for _, d := range dumpSpec.Linux.Devices {
+			if strings.HasPrefix(d.Path, "/dev/nvidia") {
+				continue
+			}
+			containerConfig.Devices = append(containerConfig.Devices, &types.Device{
+				ContainerPath: d.Path,
+				HostPath:      d.Path,
+				Permissions:   "rw",
+			})
+		}
+	}
+
+	return containerConfig
+}
+
+// processMounts processes checkpoint mounts and returns container mounts + missing mounts
+func processMounts(
+	ctx context.Context,
+	dumpSpec *spec.Spec,
+	createMounts []*types.Mount,
+	nvidiaDriverInfo *NVIDIADriverInfo,
+) ([]*types.Mount, []string) {
+	var mounts []*types.Mount
+	var missingMounts []string
+
+	for _, m := range dumpSpec.Mounts {
+		if ignoredMounts[m.Destination] {
+			continue
+		}
+
+		// Handle NVIDIA mounts
+		if IsNVIDIAMount(m.Destination) {
+			if mount := processNVIDIAMount(ctx, m, nvidiaDriverInfo); mount != nil {
+				mounts = append(mounts, mount)
+			}
+			continue
+		}
+
+		// Process regular mount
+		if mount := findMatchingMount(m.Destination, createMounts); mount != nil {
+			log.Debugf(ctx, "Adding mount %#v", mount)
+			mounts = append(mounts, mount)
+		} else {
+			missingMounts = append(missingMounts, m.Destination)
+		}
+	}
+
+	return mounts, missingMounts
+}
+
+// processNVIDIAMount handles NVIDIA-specific mount mapping
+func processNVIDIAMount(ctx context.Context, m spec.Mount, nvidiaDriverInfo *NVIDIADriverInfo) *types.Mount {
+	log.Debugf(ctx, "Detected NVIDIA mount from checkpoint: %s -> %s", m.Source, m.Destination)
+	checkDriverCompatibility(ctx, m.Source, nvidiaDriverInfo.DriverVersion)
+
+	nodePath, mapped := mapNVIDIAMountPath(ctx, m.Source, nvidiaDriverInfo)
+	if !mapped {
+		if fileExists(m.Source) {
+			nodePath = m.Source
+			log.Debugf(ctx, "Using original NVIDIA path as-is: %s", m.Source)
+		} else {
+			log.Warnf(ctx, "Could not map NVIDIA mount %s to current node, skipping", m.Source)
+			return nil
+		}
+	}
+
+	if !fileExists(nodePath) {
+		log.Warnf(ctx, "Mapped NVIDIA mount source %s does not exist on host, skipping", nodePath)
+		return nil
+	}
+
+	log.Infof(ctx, "Successfully mapped NVIDIA mount: %s -> %s (host: %s)", m.Source, m.Destination, nodePath)
+	mappedMount := m
+	mappedMount.Source = nodePath
+	return createNVIDIAMount(mappedMount)
+}
+
+// findMatchingMount finds a matching mount from create request
+func findMatchingMount(destination string, createMounts []*types.Mount) *types.Mount {
+	for _, createMount := range createMounts {
+		if createMount.GetContainerPath() == destination {
+			return &types.Mount{
+				ContainerPath:     destination,
+				HostPath:          createMount.GetHostPath(),
+				Readonly:          createMount.GetReadonly(),
+				RecursiveReadOnly: createMount.GetRecursiveReadOnly(),
+				Propagation:       createMount.GetPropagation(),
+			}
+		}
+	}
+	return nil
+}
+
+// filterMissingMounts filters out safe-to-skip mount paths
+func filterMissingMounts(ctx context.Context, missingMounts []string) []string {
+	var unsafeMounts []string
+	for _, mount := range missingMounts {
+		if IsNVIDIAMount(mount) {
+			log.Debugf(ctx, "Skipping NVIDIA system mount: %s", mount)
+			continue
+		}
+		unsafeMounts = append(unsafeMounts, mount)
+	}
+	return unsafeMounts
+}
+
+// extractCheckpointArchive extracts a checkpoint tar archive to a temp directory
+func extractCheckpointArchive(ctx context.Context, archivePath string) (mountPoint string, cleanup func(), err error) {
+	archiveFile, err := os.Open(archivePath)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to open checkpoint archive %s for import: %w", archivePath, err)
+	}
+
+	mountPoint, err = os.MkdirTemp("", "checkpoint")
+	if err != nil {
+		archiveFile.Close()
+		return "", nil, err
+	}
+
+	cleanup = func() {
+		archiveFile.Close()
+		if err := os.RemoveAll(mountPoint); err != nil {
+			log.Errorf(ctx, "Could not recursively remove %s: %q", mountPoint, err)
+		}
+	}
+
+	options := &archive.TarOptions{ExcludePatterns: tarExcludePatterns}
+	if err := archive.Untar(archiveFile, mountPoint, options); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("unpacking of checkpoint archive %s failed: %w", archivePath, err)
+	}
+
+	log.Debugf(ctx, "Unpacked checkpoint in %s", mountPoint)
+	return mountPoint, cleanup, nil
+}
+
+// getNVIDIADriversWithFallback detects NVIDIA drivers with fallback to empty info
+func getNVIDIADriversWithFallback(ctx context.Context) *NVIDIADriverInfo {
+	info, err := detectNVIDIADrivers(ctx)
+	if err != nil {
+		log.Warnf(ctx, "Failed to detect NVIDIA drivers: %v", err)
+		return &NVIDIADriverInfo{
+			LibraryPaths: make(map[string]string),
+			BinaryPaths:  make(map[string]string),
+		}
+	}
+
+	if len(info.LibraryPaths) > 0 || len(info.BinaryPaths) > 0 {
+		log.Infof(ctx, "Detected NVIDIA drivers - version: %s, libraries: %d, binaries: %d",
+			info.DriverVersion, len(info.LibraryPaths), len(info.BinaryPaths))
+	}
+
+	return info
 }
