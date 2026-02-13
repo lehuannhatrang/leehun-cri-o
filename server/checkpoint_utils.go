@@ -392,7 +392,10 @@ func buildContainerConfig(
 			Name:    createConfig.GetMetadata().GetName(),
 			Attempt: createConfig.GetMetadata().GetAttempt(),
 		},
-		Image: &types.ImageSpec{Image: rootFSImage},
+		Image: &types.ImageSpec{
+			Image:              rootFSImage,
+			UserSpecifiedImage: createConfig.GetImage().GetUserSpecifiedImage(),
+		},
 		Linux: &types.LinuxContainerConfig{
 			Resources:       &types.LinuxContainerResources{},
 			SecurityContext: &types.LinuxContainerSecurityContext{},
