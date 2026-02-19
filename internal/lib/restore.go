@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,23 @@ import (
 	"github.com/cri-o/cri-o/internal/annotations"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
+)
+
+// criuDeviceRestorerScript is the path to the CRIU action script that
+// remounts devices into the container after a CRIU restore.
+// This is set at build time via -ldflags to match the install PREFIX.
+// Defaults to /usr/libexec/crio/criu-device-restorer.sh for production builds.
+var criuDeviceRestorerScript = "/usr/libexec/crio/criu-device-restorer.sh"
+
+const (
+
+	// deviceMappingFile is the name of the JSON file written into the CRIU
+	// image directory containing host-to-container device mappings.
+	deviceMappingFile = "device-mapping.json"
+
+	// criuConfigFile is the name of the CRIU configuration file written
+	// alongside the checkpoint that tells CRIU to invoke the action script.
+	criuConfigFile = "criu-restore.conf"
 )
 
 // ContainerRestore restores a checkpointed container.
@@ -284,6 +302,13 @@ func (c *ContainerServer) ContainerRestore(
 
 	ctr.SetSandbox(ctr.Sandbox())
 
+	// Generate device mapping metadata and CRIU config for the action script.
+	// This must happen before saving config.json so the annotation is included.
+	deviceMappingPath, criuConfigPath, err := writeDeviceRestoreMetadata(ctx, ctr, &ctrSpec)
+	if err != nil {
+		return "", fmt.Errorf("failed to write device restore metadata: %w", err)
+	}
+
 	saveOptions := generate.ExportOptions{}
 	if err := ctrSpec.SaveToFile(filepath.Join(ctr.Dir(), "config.json"), saveOptions); err != nil {
 		return "", err
@@ -293,13 +318,18 @@ func (c *ContainerServer) ContainerRestore(
 		return "", err
 	}
 
-	if err := c.runtime.RestoreContainer(
+	restoreErr := c.runtime.RestoreContainer(
 		ctx,
 		ctr,
 		sb.CgroupParent(),
 		sb.MountLabel(),
-	); err != nil {
-		return "", fmt.Errorf("failed to restore container %s: %w", ctr.ID(), err)
+	)
+
+	// Clean up device mapping and CRIU config files regardless of success/failure.
+	cleanupDeviceRestoreMetadata(ctx, deviceMappingPath, criuConfigPath)
+
+	if restoreErr != nil {
+		return "", fmt.Errorf("failed to restore container %s: %w", ctr.ID(), restoreErr)
 	}
 
 	if err := c.ContainerStateToDisk(ctx, ctr); err != nil {
@@ -358,4 +388,126 @@ func (c *ContainerServer) restoreFileSystemChanges(ctr *oci.Container, mountPoin
 	}
 
 	return nil
+}
+
+// deviceMapping represents a single host-to-container device mapping entry
+// written to the device-mapping.json file for the CRIU action script.
+type deviceMapping struct {
+	// HostPath is the device path on the host (e.g., /dev/nvidia0).
+	HostPath string `json:"host_path"`
+	// ContainerPath is the expected device path inside the container.
+	ContainerPath string `json:"container_path"`
+	// Type is the device type (e.g., "c" for char, "b" for block).
+	Type string `json:"type"`
+	// Major is the device major number on the host.
+	Major int64 `json:"major"`
+	// Minor is the device minor number on the host.
+	Minor int64 `json:"minor"`
+	// FileMode is the device file permissions (e.g., 0666).
+	FileMode os.FileMode `json:"file_mode,omitempty"`
+}
+
+// writeDeviceRestoreMetadata generates device-mapping.json and the CRIU config
+// file inside the checkpoint directory, and injects the org.criu.config
+// annotation into the OCI spec so runc passes the config to CRIU.
+//
+// Returns paths to the created files (empty strings if no devices to map).
+func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec *generate.Generator) (string, string, error) {
+	if ctrSpec.Config.Linux == nil || len(ctrSpec.Config.Linux.Devices) == 0 {
+		log.Debugf(ctx, "No devices in OCI spec for container %s, skipping device restore metadata", ctr.ID())
+		return "", "", nil
+	}
+
+	// Verify the action script exists on disk.
+	if _, err := os.Stat(criuDeviceRestorerScript); err != nil {
+		log.Warnf(ctx, "CRIU device restorer script not found at %s, skipping device restore metadata: %v",
+			criuDeviceRestorerScript, err)
+		return "", "", nil
+	}
+
+	// Build device mapping entries from the OCI spec.
+	var mappings []deviceMapping
+	for _, d := range ctrSpec.Config.Linux.Devices {
+		var mode os.FileMode
+		if d.FileMode != nil {
+			mode = *d.FileMode
+		}
+		mappings = append(mappings, deviceMapping{
+			HostPath:      d.Path,
+			ContainerPath: d.Path,
+			Type:          d.Type,
+			Major:         d.Major,
+			Minor:         d.Minor,
+			FileMode:      mode,
+		})
+	}
+
+	if len(mappings) == 0 {
+		return "", "", nil
+	}
+
+	checkpointDir := ctr.CheckpointPath()
+
+	// Write device-mapping.json into the CRIU image directory.
+	mappingJSON, err := json.MarshalIndent(mappings, "", "  ")
+	if err != nil {
+		return "", "", fmt.Errorf("marshal device mappings: %w", err)
+	}
+
+	mappingPath := filepath.Join(checkpointDir, deviceMappingFile)
+	if err := os.WriteFile(mappingPath, mappingJSON, 0o600); err != nil {
+		return "", "", fmt.Errorf("write %s: %w", mappingPath, err)
+	}
+
+	log.Infof(ctx, "Wrote device mapping (%d devices) to %s", len(mappings), mappingPath)
+
+	// Write a CRIU config file that enables the action script and sets
+	// restore options. CRIU reads this via --config and treats each line
+	// as a command-line option (without the leading "--").
+	//
+	// Options:
+	//   action-script:           invoke the device restorer script at post-restore
+	//   tcp-close:               close stale TCP connections instead of re-establishing them
+	//   skip-in-flight:          skip in-flight TCP data during restore (avoids retransmit errors)
+	//   log-file:                write CRIU-internal log to /tmp/criu.log for debugging
+	//   ghost-limit:             raise ghost file size limit to 100 MiB (needed for large tmpfs/device files)
+	//   enable-external-masters: allow external master links in mount tree (common with bind mounts)
+	criuConfigContent := fmt.Sprintf(
+		"action-script %s\ntcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 104857600\nenable-external-masters\n",
+		criuDeviceRestorerScript,
+	)
+	configPath := filepath.Join(checkpointDir, criuConfigFile)
+	if err := os.WriteFile(configPath, []byte(criuConfigContent), 0o600); err != nil {
+		// Clean up the mapping file we already wrote.
+		os.Remove(mappingPath)
+		return "", "", fmt.Errorf("write %s: %w", configPath, err)
+	}
+
+	log.Infof(ctx, "Wrote CRIU config (action-script) to %s", configPath)
+
+	// Inject the org.criu.config annotation so the OCI runtime passes
+	// the CRIU config file path to CRIU during restore.
+	ctrSpec.AddAnnotation(annotations.CRIUConfigAnnotation, configPath)
+
+	return mappingPath, configPath, nil
+}
+
+// cleanupDeviceRestoreMetadata removes the device-mapping.json and CRIU config
+// files that were created for the restore operation.
+func cleanupDeviceRestoreMetadata(ctx context.Context, mappingPath, configPath string) {
+	if mappingPath != "" {
+		if err := os.Remove(mappingPath); err != nil && !os.IsNotExist(err) {
+			log.Warnf(ctx, "Failed to clean up device mapping file %s: %v", mappingPath, err)
+		} else {
+			log.Debugf(ctx, "Cleaned up device mapping file %s", mappingPath)
+		}
+	}
+
+	if configPath != "" {
+		if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
+			log.Warnf(ctx, "Failed to clean up CRIU config file %s: %v", configPath, err)
+		} else {
+			log.Debugf(ctx, "Cleaned up CRIU config file %s", configPath)
+		}
+	}
 }

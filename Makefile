@@ -96,7 +96,8 @@ else
 endif
 
 BASE_LDFLAGS = ${SHRINKFLAGS} \
-	-X ${PROJECT}/internal/version.buildDate=${BUILD_DATE}
+	-X ${PROJECT}/internal/version.buildDate=${BUILD_DATE} \
+	-X ${PROJECT}/internal/lib.criuDeviceRestorerScript=${LIBEXECDIR}/crio/criu-device-restorer.sh
 
 GO_LDFLAGS = -ldflags '${BASE_LDFLAGS} ${EXTRA_LDFLAGS}'
 
@@ -244,7 +245,7 @@ metrics-exporter: bin/metrics-exporter ## Build the metrics exporter container.
 		-t quay.io/crio/metrics-exporter:latest
 
 .PHONY: install
-install: install.bin install.man install.completions install.systemd install.config ## Install the project locally.
+install: install.bin install.man install.completions install.systemd install.config install.criu-scripts ## Install the project locally.
 
 .PHONY: install.bin-nobuild
 install.bin-nobuild: ## Install the binaries.
@@ -289,6 +290,10 @@ install.systemd: ## Install the systemd unit files.
 	install ${SELINUXOPT} -D -m 644 contrib/systemd/crio.service $(PREFIX)/lib/systemd/system/crio.service
 	install ${SELINUXOPT} -D -m 644 contrib/systemd/crio-wipe.service $(PREFIX)/lib/systemd/system/crio-wipe.service
 
+.PHONY: install.criu-scripts
+install.criu-scripts: ## Install the CRIU action scripts for checkpoint/restore.
+	install ${SELINUXOPT} -D -m 755 contrib/criu-device-restorer/criu-device-restorer.sh $(LIBEXECDIR)/crio/criu-device-restorer.sh
+
 .PHONY: uninstall
 uninstall: ## Uninstall all files.
 	rm -f $(BINDIR)/crio
@@ -308,6 +313,7 @@ uninstall: ## Uninstall all files.
 	rm -rf $(DATAROOTDIR)/oci/hooks.d
 	rm -f $(ETCDIR_CRIO)/crio.conf
 	rm -rf $(ETCDIR_CRIO)/crio.conf.d
+	rm -f $(LIBEXECDIR)/crio/criu-device-restorer.sh
 	rm -f $(OCIUMOUNTINSTALLDIR)/crio-umount.conf
 	rm -f $(CRICTL_CONFIG_DIR)/crictl.yaml
 

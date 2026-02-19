@@ -37,4 +37,8 @@ const (
 	// creating a checkpoint image to specify the version of CRIU used on the
 	// host where the checkpoint was created.
 	CheckpointAnnotationCriuVersion = "io.kubernetes.cri-o.annotations.checkpoint.criu.version"
+
+	// CRIUConfigAnnotation is the OCI annotation key recognized by runc/crun
+	// to pass a CRIU configuration file path to CRIU during restore.
+	CRIUConfigAnnotation = "org.criu.config"
 )
