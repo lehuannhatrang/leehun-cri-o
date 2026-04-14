@@ -400,6 +400,7 @@ func buildContainerConfig(
 			Resources:       &types.LinuxContainerResources{},
 			SecurityContext: &types.LinuxContainerSecurityContext{},
 		},
+		Envs:        createConfig.GetEnvs(),
 		Annotations: originalAnnotations,
 		Labels:      createConfig.GetLabels(),
 	}
