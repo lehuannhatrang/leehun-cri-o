@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
 	"github.com/checkpoint-restore/go-criu/v7/stats"
@@ -18,6 +19,7 @@ import (
 	"github.com/cri-o/cri-o/internal/annotations"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 // criuDeviceRestorerScript is the path to the CRIU action script that
@@ -302,6 +304,10 @@ func (c *ContainerServer) ContainerRestore(
 
 	ctr.SetSandbox(ctr.Sandbox())
 
+	// nvidia-container-runtime intercepts "runc create" but not "runc restore",
+	// so GPU CDI state (devices, cgroup rules, hooks) must be injected here.
+	injectCDIDevicesForRestore(ctx, &ctrSpec)
+
 	// Generate device mapping metadata and CRIU config for the action script.
 	// This must happen before saving config.json so the annotation is included.
 	deviceMappingPath, criuConfigPath, err := writeDeviceRestoreMetadata(ctx, ctr, &ctrSpec)
@@ -407,17 +413,79 @@ type deviceMapping struct {
 	FileMode os.FileMode `json:"file_mode,omitempty"`
 }
 
+// injectCDIDevicesForRestore merges CDI device names from NVIDIA_VISIBLE_DEVICES
+// (and CDI annotations) into the OCI spec via cdi.InjectDevices.
+func injectCDIDevicesForRestore(ctx context.Context, ctrSpec *generate.Generator) {
+	if ctrSpec.Config.Process == nil {
+		return
+	}
+
+	// Collect CDI device names from NVIDIA_VISIBLE_DEVICES env.
+	// KAI scheduler and NVIDIA device plugin set this to CDI-format names
+	// like "k8s.device-plugin.nvidia.com/gpu=GPU-7ee58073-..."
+	var cdiNames []string
+	for _, env := range ctrSpec.Config.Process.Env {
+		if !strings.HasPrefix(env, "NVIDIA_VISIBLE_DEVICES=") {
+			continue
+		}
+		val := strings.TrimPrefix(env, "NVIDIA_VISIBLE_DEVICES=")
+		if val == "" || val == "void" || val == "none" || val == "all" {
+			break
+		}
+		for _, dev := range strings.Split(val, ",") {
+			dev = strings.TrimSpace(dev)
+			// CDI qualified name: <vendor>/<class>=<name>
+			if idx := strings.LastIndex(dev, "="); idx != -1 && strings.Contains(dev[:idx], "/") {
+				cdiNames = append(cdiNames, dev)
+			}
+		}
+		break
+	}
+
+	// Also check CDI device annotations (older DRA drivers use these)
+	if annots := ctrSpec.Config.Annotations; annots != nil {
+		_, annotated, err := cdi.ParseAnnotations(annots)
+		if err == nil {
+			for _, name := range annotated {
+				cdiNames = append(cdiNames, name)
+			}
+		}
+	}
+
+	if len(cdiNames) == 0 {
+		return
+	}
+
+	// Deduplicate
+	seen := make(map[string]bool)
+	var unique []string
+	for _, name := range cdiNames {
+		if !seen[name] {
+			seen[name] = true
+			unique = append(unique, name)
+		}
+	}
+	cdiNames = unique
+
+	if err := cdi.Refresh(); err != nil {
+		log.Warnf(ctx, "CDI registry refresh had errors: %v", err)
+	}
+
+	unresolved, err := cdi.InjectDevices(ctrSpec.Config, cdiNames...)
+	if err != nil {
+		log.Warnf(ctx, "CDI device injection for restore failed: %v (unresolved: %v)", err, unresolved)
+		return
+	}
+
+	log.Infof(ctx, "CDI devices injected for restore: %v", cdiNames)
+}
+
 // writeDeviceRestoreMetadata generates device-mapping.json and the CRIU config
 // file inside the checkpoint directory, and injects the org.criu.config
 // annotation into the OCI spec so runc passes the config to CRIU.
 //
 // Returns paths to the created files (empty strings if no devices to map).
 func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec *generate.Generator) (string, string, error) {
-	if ctrSpec.Config.Linux == nil || len(ctrSpec.Config.Linux.Devices) == 0 {
-		log.Debugf(ctx, "No devices in OCI spec for container %s, skipping device restore metadata", ctr.ID())
-		return "", "", nil
-	}
-
 	// Verify the action script exists on disk.
 	if _, err := os.Stat(criuDeviceRestorerScript); err != nil {
 		log.Warnf(ctx, "CRIU device restorer script not found at %s, skipping device restore metadata: %v",
@@ -427,22 +495,25 @@ func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec
 
 	// Build device mapping entries from the OCI spec.
 	var mappings []deviceMapping
-	for _, d := range ctrSpec.Config.Linux.Devices {
-		var mode os.FileMode
-		if d.FileMode != nil {
-			mode = *d.FileMode
+	if ctrSpec.Config.Linux != nil {
+		for _, d := range ctrSpec.Config.Linux.Devices {
+			var mode os.FileMode
+			if d.FileMode != nil {
+				mode = *d.FileMode
+			}
+			mappings = append(mappings, deviceMapping{
+				HostPath:      d.Path,
+				ContainerPath: d.Path,
+				Type:          d.Type,
+				Major:         d.Major,
+				Minor:         d.Minor,
+				FileMode:      mode,
+			})
 		}
-		mappings = append(mappings, deviceMapping{
-			HostPath:      d.Path,
-			ContainerPath: d.Path,
-			Type:          d.Type,
-			Major:         d.Major,
-			Minor:         d.Minor,
-			FileMode:      mode,
-		})
 	}
 
 	if len(mappings) == 0 {
+		log.Debugf(ctx, "No devices to map for container %s, skipping device restore metadata", ctr.ID())
 		return "", "", nil
 	}
 
