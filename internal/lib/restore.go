@@ -11,12 +11,14 @@ import (
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
 	"github.com/checkpoint-restore/go-criu/v7/stats"
+	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/sirupsen/logrus"
 	"go.podman.io/common/pkg/crutils"
 	"go.podman.io/storage/pkg/archive"
 
 	"github.com/cri-o/cri-o/internal/annotations"
+	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
 	"tags.cncf.io/container-device-interface/pkg/cdi"
@@ -37,6 +39,18 @@ const (
 	// criuConfigFile is the name of the CRIU configuration file written
 	// alongside the checkpoint that tells CRIU to invoke the action script.
 	criuConfigFile = "criu-restore.conf"
+
+	// hamiDRALabel is the pod label that marks a pod as managed by the
+	// HAMi DRA driver. When set to "true", HAMi creates per-container
+	// directories under hamiVGPUContainersPrefix; these get a new UUID
+	// each time the pod is (re)scheduled, so during checkpoint/restore
+	// we must remap the original path via CRIU's ext-mount-map.
+	hamiDRALabel = "hami.io/dra"
+
+	// hamiVGPUContainersPrefix is the host-side directory under which
+	// HAMi creates one subdirectory per container in the form
+	// "<UUID>_<container_name>" and bind-mounts it into the container.
+	hamiVGPUContainersPrefix = "/usr/local/vgpu/containers/"
 )
 
 // ContainerRestore restores a checkpointed container.
@@ -84,6 +98,13 @@ func (c *ContainerServer) ContainerRestore(
 		return "", err
 	}
 
+	// hamiOldVGPUPaths captures the original HAMi vGPU bind-mount source
+	// paths recorded in the checkpoint. They are needed to emit CRIU
+	// ext-mount-map entries because HAMi assigns a new UUID-named
+	// directory to each freshly created pod, so the old path is gone
+	// by the time we restore.
+	var hamiOldVGPUPaths []string
+
 	if ctr.RestoreArchivePath() != "" || ctr.RestoreStorageImageID() != nil {
 		if ctr.RestoreStorageImageID() != nil {
 			log.Debugf(ctx, "Restoring from %v", ctr.RestoreStorageImageID())
@@ -126,9 +147,19 @@ func (c *ContainerServer) ContainerRestore(
 					logrus.Debugf("Can't import '%s' from checkpoint image", name)
 				}
 			}
+
+			// Pick up the original HAMi vGPU mount sources before we drop
+			// access to the checkpoint image.
+			if isHAMiPod(sb) {
+				hamiOldVGPUPaths = readHAMiVGPUSourcesFromImage(ctx, imageMountPoint)
+			}
 		} else {
 			if err := crutils.CRImportCheckpointWithoutConfig(ctr.Dir(), ctr.RestoreArchivePath()); err != nil {
 				return "", err
+			}
+
+			if isHAMiPod(sb) {
+				hamiOldVGPUPaths = readHAMiVGPUSourcesFromArchive(ctx, ctr.RestoreArchivePath())
 			}
 		}
 
@@ -310,7 +341,7 @@ func (c *ContainerServer) ContainerRestore(
 
 	// Generate device mapping metadata and CRIU config for the action script.
 	// This must happen before saving config.json so the annotation is included.
-	deviceMappingPath, criuConfigPath, err := writeDeviceRestoreMetadata(ctx, ctr, &ctrSpec)
+	deviceMappingPath, criuConfigPath, err := writeDeviceRestoreMetadata(ctx, ctr, &ctrSpec, hamiOldVGPUPaths)
 	if err != nil {
 		return "", fmt.Errorf("failed to write device restore metadata: %w", err)
 	}
@@ -484,13 +515,26 @@ func injectCDIDevicesForRestore(ctx context.Context, ctrSpec *generate.Generator
 // file inside the checkpoint directory, and injects the org.criu.config
 // annotation into the OCI spec so runc passes the config to CRIU.
 //
+// hamiOldVGPUPaths, when non-empty, lists the original HAMi vGPU bind-mount
+// sources from the checkpoint; the function pairs them with the current
+// HAMi vGPU sources found in ctrSpec and adds CRIU ext-mount-map entries
+// so that mounts marked external in the checkpoint can be re-bound from
+// the new host paths.
+//
 // Returns paths to the created files (empty strings if no devices to map).
-func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec *generate.Generator) (string, string, error) {
+func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec *generate.Generator, hamiOldVGPUPaths []string) (string, string, error) {
+	hamiExtMountLines := buildHAMiExtMountMapLines(ctx, hamiOldVGPUPaths, ctrSpec)
+
 	// Verify the action script exists on disk.
 	if _, err := os.Stat(criuDeviceRestorerScript); err != nil {
 		log.Warnf(ctx, "CRIU device restorer script not found at %s, skipping device restore metadata: %v",
 			criuDeviceRestorerScript, err)
-		return "", "", nil
+		// Even without the device action script we still want CRIU to see
+		// the HAMi ext-mount-map entries, otherwise restore will fail with
+		// "No mapping for ... mountpoint".
+		if hamiExtMountLines == "" {
+			return "", "", nil
+		}
 	}
 
 	// Build device mapping entries from the OCI spec.
@@ -512,25 +556,27 @@ func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec
 		}
 	}
 
-	if len(mappings) == 0 {
+	if len(mappings) == 0 && hamiExtMountLines == "" {
 		log.Debugf(ctx, "No devices to map for container %s, skipping device restore metadata", ctr.ID())
 		return "", "", nil
 	}
 
 	checkpointDir := ctr.CheckpointPath()
 
-	// Write device-mapping.json into the CRIU image directory.
-	mappingJSON, err := json.MarshalIndent(mappings, "", "  ")
-	if err != nil {
-		return "", "", fmt.Errorf("marshal device mappings: %w", err)
-	}
+	var mappingPath string
+	if len(mappings) > 0 {
+		mappingJSON, err := json.MarshalIndent(mappings, "", "  ")
+		if err != nil {
+			return "", "", fmt.Errorf("marshal device mappings: %w", err)
+		}
 
-	mappingPath := filepath.Join(checkpointDir, deviceMappingFile)
-	if err := os.WriteFile(mappingPath, mappingJSON, 0o600); err != nil {
-		return "", "", fmt.Errorf("write %s: %w", mappingPath, err)
-	}
+		mappingPath = filepath.Join(checkpointDir, deviceMappingFile)
+		if err := os.WriteFile(mappingPath, mappingJSON, 0o600); err != nil {
+			return "", "", fmt.Errorf("write %s: %w", mappingPath, err)
+		}
 
-	log.Infof(ctx, "Wrote device mapping (%d devices) to %s", len(mappings), mappingPath)
+		log.Infof(ctx, "Wrote device mapping (%d devices) to %s", len(mappings), mappingPath)
+	}
 
 	// Write a CRIU config file that enables the action script and sets
 	// restore options. CRIU reads this via --config and treats each line
@@ -543,24 +589,173 @@ func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec
 	//   log-file:                write CRIU-internal log to /tmp/criu.log for debugging
 	//   ghost-limit:             raise ghost file size limit to 100 MiB (needed for large tmpfs/device files)
 	//   enable-external-masters: allow external master links in mount tree (common with bind mounts)
-	criuConfigContent := fmt.Sprintf(
-		"action-script %s\ntcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 104857600\nenable-external-masters\n",
-		criuDeviceRestorerScript,
-	)
+	//   ext-mount-map:           remap external mounts captured at checkpoint time
+	//                            (used for HAMi vGPU directories whose UUID
+	//                            changes on every pod creation)
+	var criuConfigContent string
+	if _, err := os.Stat(criuDeviceRestorerScript); err == nil {
+		criuConfigContent = fmt.Sprintf(
+			"action-script %s\ntcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 104857600\nenable-external-masters\n",
+			criuDeviceRestorerScript,
+		)
+	} else {
+		criuConfigContent = "tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 104857600\nenable-external-masters\n"
+	}
+
+	criuConfigContent += hamiExtMountLines
+
 	configPath := filepath.Join(checkpointDir, criuConfigFile)
 	if err := os.WriteFile(configPath, []byte(criuConfigContent), 0o600); err != nil {
 		// Clean up the mapping file we already wrote.
-		os.Remove(mappingPath)
+		if mappingPath != "" {
+			os.Remove(mappingPath)
+		}
 		return "", "", fmt.Errorf("write %s: %w", configPath, err)
 	}
 
-	log.Infof(ctx, "Wrote CRIU config (action-script) to %s", configPath)
+	log.Infof(ctx, "Wrote CRIU config to %s", configPath)
 
 	// Inject the org.criu.config annotation so the OCI runtime passes
 	// the CRIU config file path to CRIU during restore.
 	ctrSpec.AddAnnotation(annotations.CRIUConfigAnnotation, configPath)
 
 	return mappingPath, configPath, nil
+}
+
+// isHAMiPod reports whether the sandbox carries the HAMi DRA label that
+// marks a pod as managed by the HAMi DRA driver.
+func isHAMiPod(sb *sandbox.Sandbox) bool {
+	if sb == nil {
+		return false
+	}
+	return sb.Labels()[hamiDRALabel] == "true"
+}
+
+// readHAMiVGPUSourcesFromImage reads spec.dump from an already-mounted
+// checkpoint OCI image and returns the source paths of HAMi vGPU bind
+// mounts recorded in it.
+func readHAMiVGPUSourcesFromImage(ctx context.Context, imageMountPoint string) []string {
+	var dumpSpec rspec.Spec
+	if _, err := metadata.ReadJSONFile(&dumpSpec, imageMountPoint, metadata.SpecDumpFile); err != nil {
+		log.Warnf(ctx, "Failed to read spec.dump for HAMi vGPU remap: %v", err)
+		return nil
+	}
+	return extractHAMiVGPUSources(&dumpSpec)
+}
+
+// readHAMiVGPUSourcesFromArchive extracts spec.dump from a checkpoint tar
+// archive (without disturbing the main restore extraction, which omits
+// spec.dump) and returns the HAMi vGPU bind-mount sources from it.
+func readHAMiVGPUSourcesFromArchive(ctx context.Context, archivePath string) []string {
+	tmpDir, err := os.MkdirTemp("", "crio-hami-spec-")
+	if err != nil {
+		log.Warnf(ctx, "Failed to create temp dir for HAMi spec.dump: %v", err)
+		return nil
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := crutils.CRImportCheckpointConfigOnly(tmpDir, archivePath); err != nil {
+		log.Warnf(ctx, "Failed to extract spec.dump from checkpoint archive %s: %v", archivePath, err)
+		return nil
+	}
+
+	var dumpSpec rspec.Spec
+	if _, err := metadata.ReadJSONFile(&dumpSpec, tmpDir, metadata.SpecDumpFile); err != nil {
+		log.Warnf(ctx, "Failed to read spec.dump for HAMi vGPU remap: %v", err)
+		return nil
+	}
+	return extractHAMiVGPUSources(&dumpSpec)
+}
+
+// extractHAMiVGPUSources returns the source paths of HAMi vGPU bind mounts
+// (those rooted at hamiVGPUContainersPrefix) found in the given spec.
+func extractHAMiVGPUSources(s *rspec.Spec) []string {
+	var paths []string
+	for _, m := range s.Mounts {
+		if strings.HasPrefix(m.Source, hamiVGPUContainersPrefix) {
+			paths = append(paths, m.Source)
+		}
+	}
+	return paths
+}
+
+// buildHAMiExtMountMapLines pairs each old HAMi vGPU source path (from the
+// checkpoint) with the current host source path found in the OCI spec and
+// returns one "ext-mount-map <old>:<new>\n" line per pair. Pairing is done
+// by the trailing container-name part (everything after the leading UUID
+// segment) so that pods with multiple vGPU mounts still match correctly.
+//
+// Returns an empty string when there is nothing to remap.
+func buildHAMiExtMountMapLines(ctx context.Context, oldPaths []string, ctrSpec *generate.Generator) string {
+	if len(oldPaths) == 0 {
+		return ""
+	}
+	if ctrSpec == nil || ctrSpec.Config == nil {
+		return ""
+	}
+
+	var newPaths []string
+	for _, m := range ctrSpec.Config.Mounts {
+		if strings.HasPrefix(m.Source, hamiVGPUContainersPrefix) {
+			newPaths = append(newPaths, m.Source)
+		}
+	}
+	if len(newPaths) == 0 {
+		log.Warnf(ctx, "HAMi pod has %d checkpointed vGPU mount(s) (%v) but no new vGPU mounts in the restored spec; skipping ext-mount-map",
+			len(oldPaths), oldPaths)
+		return ""
+	}
+
+	used := make(map[string]bool, len(newPaths))
+	var b strings.Builder
+	for _, oldPath := range oldPaths {
+		newPath := pickHAMiVGPUMatch(oldPath, newPaths, used)
+		if newPath == "" {
+			log.Warnf(ctx, "No matching new HAMi vGPU mount for checkpointed path %s", oldPath)
+			continue
+		}
+		used[newPath] = true
+		fmt.Fprintf(&b, "ext-mount-map %s:%s\n", oldPath, newPath)
+		log.Infof(ctx, "HAMi vGPU ext-mount-map: %s -> %s", oldPath, newPath)
+	}
+	return b.String()
+}
+
+// pickHAMiVGPUMatch picks a new HAMi vGPU mount source to pair with the
+// given old source path. It prefers an unused candidate whose
+// container-name suffix matches; otherwise it falls back to any unused
+// candidate (the common case of a single vGPU mount per container).
+func pickHAMiVGPUMatch(oldPath string, newPaths []string, used map[string]bool) string {
+	oldSuffix := hamiContainerNameSuffix(oldPath)
+	if oldSuffix != "" {
+		for _, p := range newPaths {
+			if used[p] {
+				continue
+			}
+			if hamiContainerNameSuffix(p) == oldSuffix {
+				return p
+			}
+		}
+	}
+	for _, p := range newPaths {
+		if !used[p] {
+			return p
+		}
+	}
+	return ""
+}
+
+// hamiContainerNameSuffix returns the container-name part of a HAMi vGPU
+// directory path. HAMi names the directory "<UUID>_<container_name>"; the
+// UUID is 36 characters followed by an underscore. An empty string is
+// returned when the basename does not match this convention.
+func hamiContainerNameSuffix(p string) string {
+	base := filepath.Base(p)
+	const uuidLen = 36
+	if len(base) > uuidLen+1 && base[uuidLen] == '_' {
+		return base[uuidLen+1:]
+	}
+	return ""
 }
 
 // cleanupDeviceRestoreMetadata removes the device-mapping.json and CRIU config
