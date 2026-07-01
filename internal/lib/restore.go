@@ -50,7 +50,7 @@ const (
 	// hamiVGPUContainersPrefix is the host-side directory under which
 	// HAMi creates one subdirectory per container in the form
 	// "<UUID>_<container_name>" and bind-mounts it into the container.
-	hamiVGPUContainersPrefix = "/usr/local/vgpu/containers/"
+	hamiVGPUContainersPrefix = "/usr/local/vgpu/claims/"
 )
 
 // ContainerRestore restores a checkpointed container.
