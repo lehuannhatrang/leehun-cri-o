@@ -173,6 +173,16 @@ Directories later in the list have precedence over earlier ones. The default dir
   ]
 ```
 
+**hami_vgpu_mount_prefixes**=[]
+Host directory prefixes under which the HAMi vGPU driver creates one per-allocation directory that is bind-mounted into the container. CRI-O remaps these paths during container checkpoint/restore using CRIU's ext-mount-map. HAMi has changed this location across versions (the device-plugin architecture used ".../containers/" while Dynamic Resource Allocation uses ".../claims/"), so adjust the list to match your deployment. The default list is:
+
+```
+  hami_vgpu_mount_prefixes = [
+	  "/usr/local/vgpu/claims/",
+	  "/usr/local/vgpu/containers/",
+  ]
+```
+
 **irqbalance_config_file**="/etc/sysconfig/irqbalance"
 Used to change irqbalance service config file which is used by CRI-O.
 For CentOS/SUSE, this file is located at /etc/sysconfig/irqbalance. For Ubuntu, this file is located at /etc/default/irqbalance.

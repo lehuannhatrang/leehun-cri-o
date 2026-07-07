@@ -21,6 +21,7 @@ import (
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
+	libconfig "github.com/cri-o/cri-o/pkg/config"
 	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
@@ -41,16 +42,14 @@ const (
 	criuConfigFile = "criu-restore.conf"
 
 	// hamiDRALabel is the pod label that marks a pod as managed by the
-	// HAMi DRA driver. When set to "true", HAMi creates per-container
-	// directories under hamiVGPUContainersPrefix; these get a new UUID
-	// each time the pod is (re)scheduled, so during checkpoint/restore
-	// we must remap the original path via CRIU's ext-mount-map.
+	// HAMi DRA driver. When set to "true", HAMi creates one per-allocation
+	// directory under one of the configured HAMi vGPU mount prefixes (see
+	// RuntimeConfig.HAMiVGPUMountPrefixes) and bind-mounts it into the
+	// container; the directory name embeds a value (container UUID or
+	// ResourceClaim UID) that changes each time the pod/claim is
+	// (re)created, so during checkpoint/restore we must remap the original
+	// path via CRIU's ext-mount-map.
 	hamiDRALabel = "hami.io/dra"
-
-	// hamiVGPUContainersPrefix is the host-side directory under which
-	// HAMi creates one subdirectory per container in the form
-	// "<UUID>_<container_name>" and bind-mounts it into the container.
-	hamiVGPUContainersPrefix = "/usr/local/vgpu/containers/"
 )
 
 // ContainerRestore restores a checkpointed container.
@@ -105,6 +104,11 @@ func (c *ContainerServer) ContainerRestore(
 	// by the time we restore.
 	var hamiOldVGPUPaths []string
 
+	// hamiVGPUPrefixes is the operator-configurable set of host directory
+	// prefixes under which HAMi creates the per-allocation directories that
+	// must be remapped on restore.
+	hamiVGPUPrefixes := c.hamiVGPUMountPrefixes()
+
 	if ctr.RestoreArchivePath() != "" || ctr.RestoreStorageImageID() != nil {
 		if ctr.RestoreStorageImageID() != nil {
 			log.Debugf(ctx, "Restoring from %v", ctr.RestoreStorageImageID())
@@ -151,7 +155,7 @@ func (c *ContainerServer) ContainerRestore(
 			// Pick up the original HAMi vGPU mount sources before we drop
 			// access to the checkpoint image.
 			if isHAMiPod(sb) {
-				hamiOldVGPUPaths = readHAMiVGPUSourcesFromImage(ctx, imageMountPoint)
+				hamiOldVGPUPaths = readHAMiVGPUSourcesFromImage(ctx, imageMountPoint, hamiVGPUPrefixes)
 			}
 		} else {
 			if err := crutils.CRImportCheckpointWithoutConfig(ctr.Dir(), ctr.RestoreArchivePath()); err != nil {
@@ -159,7 +163,7 @@ func (c *ContainerServer) ContainerRestore(
 			}
 
 			if isHAMiPod(sb) {
-				hamiOldVGPUPaths = readHAMiVGPUSourcesFromArchive(ctx, ctr.RestoreArchivePath())
+				hamiOldVGPUPaths = readHAMiVGPUSourcesFromArchive(ctx, ctr.RestoreArchivePath(), hamiVGPUPrefixes)
 			}
 		}
 
@@ -341,7 +345,7 @@ func (c *ContainerServer) ContainerRestore(
 
 	// Generate device mapping metadata and CRIU config for the action script.
 	// This must happen before saving config.json so the annotation is included.
-	deviceMappingPath, criuConfigPath, err := writeDeviceRestoreMetadata(ctx, ctr, &ctrSpec, hamiOldVGPUPaths)
+	deviceMappingPath, criuConfigPath, err := writeDeviceRestoreMetadata(ctx, ctr, &ctrSpec, hamiOldVGPUPaths, hamiVGPUPrefixes)
 	if err != nil {
 		return "", fmt.Errorf("failed to write device restore metadata: %w", err)
 	}
@@ -522,8 +526,8 @@ func injectCDIDevicesForRestore(ctx context.Context, ctrSpec *generate.Generator
 // the new host paths.
 //
 // Returns paths to the created files (empty strings if no devices to map).
-func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec *generate.Generator, hamiOldVGPUPaths []string) (string, string, error) {
-	hamiExtMountLines := buildHAMiExtMountMapLines(ctx, hamiOldVGPUPaths, ctrSpec)
+func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec *generate.Generator, hamiOldVGPUPaths, hamiVGPUPrefixes []string) (string, string, error) {
+	hamiExtMountLines := buildHAMiExtMountMapLines(ctx, hamiOldVGPUPaths, ctrSpec, hamiVGPUPrefixes)
 
 	// Verify the action script exists on disk.
 	if _, err := os.Stat(criuDeviceRestorerScript); err != nil {
@@ -622,6 +626,16 @@ func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec
 	return mappingPath, configPath, nil
 }
 
+// hamiVGPUMountPrefixes returns the operator-configured HAMi vGPU mount
+// prefixes, falling back to the built-in defaults when the config is unset or
+// empty so that HAMi pods can still be restored on a default installation.
+func (c *ContainerServer) hamiVGPUMountPrefixes() []string {
+	if c.config != nil && len(c.config.HAMiVGPUMountPrefixes) > 0 {
+		return c.config.HAMiVGPUMountPrefixes
+	}
+	return libconfig.DefaultHAMiVGPUMountPrefixes
+}
+
 // isHAMiPod reports whether the sandbox carries the HAMi DRA label that
 // marks a pod as managed by the HAMi DRA driver.
 func isHAMiPod(sb *sandbox.Sandbox) bool {
@@ -634,19 +648,19 @@ func isHAMiPod(sb *sandbox.Sandbox) bool {
 // readHAMiVGPUSourcesFromImage reads spec.dump from an already-mounted
 // checkpoint OCI image and returns the source paths of HAMi vGPU bind
 // mounts recorded in it.
-func readHAMiVGPUSourcesFromImage(ctx context.Context, imageMountPoint string) []string {
+func readHAMiVGPUSourcesFromImage(ctx context.Context, imageMountPoint string, prefixes []string) []string {
 	var dumpSpec rspec.Spec
 	if _, err := metadata.ReadJSONFile(&dumpSpec, imageMountPoint, metadata.SpecDumpFile); err != nil {
 		log.Warnf(ctx, "Failed to read spec.dump for HAMi vGPU remap: %v", err)
 		return nil
 	}
-	return extractHAMiVGPUSources(&dumpSpec)
+	return extractHAMiVGPUSources(&dumpSpec, prefixes)
 }
 
 // readHAMiVGPUSourcesFromArchive extracts spec.dump from a checkpoint tar
 // archive (without disturbing the main restore extraction, which omits
 // spec.dump) and returns the HAMi vGPU bind-mount sources from it.
-func readHAMiVGPUSourcesFromArchive(ctx context.Context, archivePath string) []string {
+func readHAMiVGPUSourcesFromArchive(ctx context.Context, archivePath string, prefixes []string) []string {
 	tmpDir, err := os.MkdirTemp("", "crio-hami-spec-")
 	if err != nil {
 		log.Warnf(ctx, "Failed to create temp dir for HAMi spec.dump: %v", err)
@@ -664,15 +678,26 @@ func readHAMiVGPUSourcesFromArchive(ctx context.Context, archivePath string) []s
 		log.Warnf(ctx, "Failed to read spec.dump for HAMi vGPU remap: %v", err)
 		return nil
 	}
-	return extractHAMiVGPUSources(&dumpSpec)
+	return extractHAMiVGPUSources(&dumpSpec, prefixes)
+}
+
+// hasHAMiVGPUPrefix reports whether the given bind-mount source path lives
+// under one of the configured HAMi vGPU per-allocation directory prefixes.
+func hasHAMiVGPUPrefix(source string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(source, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractHAMiVGPUSources returns the source paths of HAMi vGPU bind mounts
-// (those rooted at hamiVGPUContainersPrefix) found in the given spec.
-func extractHAMiVGPUSources(s *rspec.Spec) []string {
+// (those rooted at one of the configured prefixes) found in the given spec.
+func extractHAMiVGPUSources(s *rspec.Spec, prefixes []string) []string {
 	var paths []string
 	for _, m := range s.Mounts {
-		if strings.HasPrefix(m.Source, hamiVGPUContainersPrefix) {
+		if hasHAMiVGPUPrefix(m.Source, prefixes) {
 			paths = append(paths, m.Source)
 		}
 	}
@@ -686,7 +711,7 @@ func extractHAMiVGPUSources(s *rspec.Spec) []string {
 // segment) so that pods with multiple vGPU mounts still match correctly.
 //
 // Returns an empty string when there is nothing to remap.
-func buildHAMiExtMountMapLines(ctx context.Context, oldPaths []string, ctrSpec *generate.Generator) string {
+func buildHAMiExtMountMapLines(ctx context.Context, oldPaths []string, ctrSpec *generate.Generator, prefixes []string) string {
 	if len(oldPaths) == 0 {
 		return ""
 	}
@@ -696,7 +721,7 @@ func buildHAMiExtMountMapLines(ctx context.Context, oldPaths []string, ctrSpec *
 
 	var newPaths []string
 	for _, m := range ctrSpec.Config.Mounts {
-		if strings.HasPrefix(m.Source, hamiVGPUContainersPrefix) {
+		if hasHAMiVGPUPrefix(m.Source, prefixes) {
 			newPaths = append(newPaths, m.Source)
 		}
 	}

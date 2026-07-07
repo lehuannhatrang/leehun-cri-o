@@ -170,6 +170,31 @@ const (
 	DefaultIrqBalanceConfigRestoreFile = "/etc/sysconfig/orig_irq_banned_cpus"
 )
 
+// DefaultHAMiVGPUMountPrefixes is the built-in list of host-side directory
+// prefixes under which the HAMi vGPU driver creates one per-allocation
+// directory that it bind-mounts into the container. HAMi moved this location
+// as it migrated from the legacy device-plugin architecture to Dynamic
+// Resource Allocation (DRA):
+//
+//   - Legacy device-plugin builds use "/usr/local/vgpu/containers/" with
+//     directories named "<UUID>_<container_name>" (one per container).
+//   - DRA builds (Project-HAMi/k8s-dra-driver) use "/usr/local/vgpu/claims/"
+//     with directories named after the ResourceClaim UID ("<claim-uid>"),
+//     because the unit of allocation is now the (shareable) ResourceClaim
+//     rather than the container.
+//
+// The directory name always carries a value that changes each time the
+// pod/claim is (re)created, so the original bind-mount source is gone by the
+// time CRI-O restores the container and must be remapped via CRIU's
+// ext-mount-map. This list is exposed as configuration so operators can track
+// future HAMi path changes without rebuilding CRI-O.
+//
+// Ordering is most-recent-first so restored pods hit the current layout first.
+var DefaultHAMiVGPUMountPrefixes = []string{
+	"/usr/local/vgpu/claims/",
+	"/usr/local/vgpu/containers/",
+}
+
 // This structure is necessary to fake the TOML tables when parsing,
 // while also not requiring a bunch of layered structs for no good
 // reason.
@@ -410,6 +435,15 @@ type RuntimeConfig struct {
 
 	// CDISpecDirs specifies the directories CRI-O/CDI will scan for CDI Spec files.
 	CDISpecDirs []string `toml:"cdi_spec_dirs"`
+
+	// HAMiVGPUMountPrefixes lists the host-side directory prefixes under which
+	// the HAMi vGPU driver creates one per-allocation directory that it
+	// bind-mounts into the container. CRI-O remaps these paths during
+	// container checkpoint/restore via CRIU's ext-mount-map. HAMi has changed
+	// this location across versions (device-plugin used ".../containers/", DRA
+	// uses ".../claims/"), so the list is configurable to track future
+	// changes. When left empty CRI-O falls back to DefaultHAMiVGPUMountPrefixes.
+	HAMiVGPUMountPrefixes []string `toml:"hami_vgpu_mount_prefixes"`
 
 	// DeviceOwnershipFromSecurityContext changes the default behavior of setting container devices uid/gid
 	// from CRI's SecurityContext (RunAsUser/RunAsGroup) instead of taking host's uid/gid. Defaults to false.
@@ -1100,6 +1134,7 @@ func DefaultRuntimeConfig(cgroupManager cgmgr.CgroupManager) *RuntimeConfig {
 		LogLevel:                    "info",
 		HooksDir:                    []string{hooks.DefaultDir},
 		CDISpecDirs:                 cdi.DefaultSpecDirs,
+		HAMiVGPUMountPrefixes:       DefaultHAMiVGPUMountPrefixes,
 		NamespacesDir:               defaultNamespacesDir,
 		DropInfraCtr:                true,
 		IrqBalanceConfigRestoreFile: DefaultIrqBalanceConfigRestoreFile,

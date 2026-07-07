@@ -57,6 +57,7 @@ crio
 [--global-auth-file]=[value]
 [--grpc-max-recv-msg-size]=[value]
 [--grpc-max-send-msg-size]=[value]
+[--hami-vgpu-mount-prefixes]=[value]
 [--help|-h]
 [--hooks-dir]=[value]
 [--hostnetwork-disable-selinux]
@@ -271,6 +272,8 @@ crio [GLOBAL OPTIONS] command [COMMAND OPTIONS] [ARGUMENTS...]
 **--grpc-max-send-msg-size**="": Maximum grpc receive message size. (default: 83886080)
 
 **--help, -h**: show help
+
+**--hami-vgpu-mount-prefixes**="": Host directory prefixes under which the HAMi vGPU driver creates per-allocation mounts that CRI-O remaps during checkpoint/restore. (default: "/usr/local/vgpu/claims/", "/usr/local/vgpu/containers/")
 
 **--hooks-dir**="": Set the OCI hooks directory path (may be set multiple times)
     If one of the directories does not exist, then CRI-O will automatically

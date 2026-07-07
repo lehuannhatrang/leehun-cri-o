@@ -338,6 +338,11 @@ func initCrioTemplateConfig(c *Config) ([]*templateConfigValue, error) {
 			isDefaultValue: slices.Equal(dc.CDISpecDirs, c.CDISpecDirs),
 		},
 		{
+			templateString: templateStringCrioRuntimeHAMiVGPUMountPrefixes,
+			group:          crioRuntimeConfig,
+			isDefaultValue: slices.Equal(dc.HAMiVGPUMountPrefixes, c.HAMiVGPUMountPrefixes),
+		},
+		{
 			templateString: templateStringCrioRuntimeDeviceOwnershipFromSecurityContext,
 			group:          crioRuntimeConfig,
 			isDefaultValue: simpleEqual(dc.DeviceOwnershipFromSecurityContext, c.DeviceOwnershipFromSecurityContext),
@@ -1045,6 +1050,15 @@ const templateStringCrioRuntimeAdditionalDevices = `# List of additional devices
 const templateStringCrioRuntimeCDISpecDirs = `# List of directories to scan for CDI Spec files.
 {{ $.Comment }}cdi_spec_dirs = [
 {{ range $dir := .CDISpecDirs }}{{ $.Comment }}{{ printf "\t%q,\n" $dir}}{{ end }}{{ $.Comment }}]
+
+`
+
+const templateStringCrioRuntimeHAMiVGPUMountPrefixes = `# List of host directory prefixes under which the HAMi vGPU driver creates
+# one per-allocation directory that is bind-mounted into the container. CRI-O
+# remaps these paths during container checkpoint/restore. HAMi has changed this
+# location across versions, so adjust the list to match your deployment.
+{{ $.Comment }}hami_vgpu_mount_prefixes = [
+{{ range $prefix := .HAMiVGPUMountPrefixes }}{{ $.Comment }}{{ printf "\t%q,\n" $prefix}}{{ end }}{{ $.Comment }}]
 
 `
 

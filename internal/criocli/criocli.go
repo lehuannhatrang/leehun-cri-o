@@ -306,6 +306,10 @@ func mergeRuntimeConfig(config *libconfig.Config, ctx *cli.Context) error {
 		config.CDISpecDirs = StringSliceTrySplit(ctx, "cdi-spec-dirs")
 	}
 
+	if ctx.IsSet("hami-vgpu-mount-prefixes") {
+		config.HAMiVGPUMountPrefixes = StringSliceTrySplit(ctx, "hami-vgpu-mount-prefixes")
+	}
+
 	if ctx.IsSet("device-ownership-from-security-context") {
 		config.DeviceOwnershipFromSecurityContext = ctx.Bool("device-ownership-from-security-context")
 	}
@@ -1295,6 +1299,12 @@ func getCrioFlags(defConf *libconfig.Config) []cli.Flag {
 			Usage:   "Directories to scan for CDI Spec files.",
 			Value:   cli.NewStringSlice(defConf.CDISpecDirs...),
 			EnvVars: []string{"CONTAINER_CDI_SPEC_DIRS"},
+		},
+		&cli.StringSliceFlag{
+			Name:    "hami-vgpu-mount-prefixes",
+			Usage:   "Host directory prefixes under which the HAMi vGPU driver creates per-allocation mounts that CRI-O remaps during checkpoint/restore.",
+			Value:   cli.NewStringSlice(defConf.HAMiVGPUMountPrefixes...),
+			EnvVars: []string{"CONTAINER_HAMI_VGPU_MOUNT_PREFIXES"},
 		},
 		&cli.BoolFlag{
 			Name:  "device-ownership-from-security-context",
