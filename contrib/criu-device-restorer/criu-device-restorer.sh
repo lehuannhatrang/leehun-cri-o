@@ -1,10 +1,10 @@
 #!/bin/bash
-# CRIU action script for remounting devices into a container after restore.
+# CRIU action script for restoring device nodes in a container after restore.
 #
 # This script is invoked by CRIU during the restore lifecycle via the
 # --action-script option. It reads device-mapping.json from the CRIU image
-# directory and bind-mounts each host device into the restored container's
-# mount namespace.
+# directory and (re)creates each device node inside the restored container's
+# mount namespace so the nodes carry the major:minor numbers of this node.
 #
 # CRIU environment variables used:
 #   CRTOOLS_SCRIPT_ACTION - The current CRIU lifecycle phase (e.g., "post-restore")
@@ -52,7 +52,7 @@ fi
 
 INIT_PID="${CRTOOLS_INIT_PID:-}"
 if [[ -z "${INIT_PID}" ]]; then
-    log_error "CRTOOLS_INIT_PID is not set, cannot remount devices"
+    log_error "CRTOOLS_INIT_PID is not set, cannot restore device nodes"
     exit 1
 fi
 
@@ -62,7 +62,7 @@ if ! kill -0 "${INIT_PID}" 2>/dev/null; then
     exit 1
 fi
 
-log_info "Post-restore device remount: image_dir=${CRTOOLS_IMAGE_DIR} init_pid=${INIT_PID}"
+log_info "Post-restore device node restore: image_dir=${CRTOOLS_IMAGE_DIR} init_pid=${INIT_PID}"
 
 # Parse the JSON device mapping. We use jq if available, otherwise fall back
 # to a simple Python one-liner (python3 is typically available on RHEL/Fedora nodes).
@@ -91,34 +91,38 @@ while IFS=' ' read -r host_path container_path dev_type major minor; do
         continue
     fi
 
-    log_info "Bind-mounting ${host_path} -> ${container_path} (type=${dev_type} ${major}:${minor})"
+    log_info "Creating device node ${container_path} (type=${dev_type} ${major}:${minor})"
 
-    # Use nsenter to enter the container's mount namespace and create +
-    # bind-mount the device. We create the device node first (in case the
-    # container's rootfs doesn't have it) and then bind-mount over it so
-    # the container sees the correct host device with current major:minor.
+    # Use nsenter to enter the container's mount namespace and recreate the
+    # device node there, so it carries the major:minor numbers this node uses.
+    #
+    # The node must NOT be bind-mounted over afterwards. Everything below runs
+    # inside the container's mount namespace, so a "mount --bind host_path
+    # container_path" resolves host_path inside the container too: it binds the
+    # node onto itself, which changes nothing but leaves one extra mount entry
+    # per device in the container's mount table. Those entries are recorded by
+    # the next checkpoint and make the restore after it fail inside CRIU with
+    # "No mapping for <id>:<path> mountpoint".
     if ! nsenter -t "${INIT_PID}" -m -- /bin/sh -c "
+        set -e
+
         # Ensure the parent directory exists.
         mkdir -p \"\$(dirname '${container_path}')\"
 
-        # Create a device node if it doesn't exist (or recreate it).
+        # Recreate the device node so it points at the current major:minor.
         rm -f '${container_path}' 2>/dev/null || true
-        mknod '${container_path}' '${dev_type}' '${major}' '${minor}' 2>/dev/null || true
-        chmod 0666 '${container_path}' 2>/dev/null || true
-
-        # Bind-mount the host device over the container path so the
-        # container references the actual host device.
-        mount --bind '${host_path}' '${container_path}'
+        mknod '${container_path}' '${dev_type}' '${major}' '${minor}'
+        chmod 0666 '${container_path}'
     "; then
-        log_error "Failed to mount ${host_path} -> ${container_path} in pid ${INIT_PID}"
+        log_error "Failed to create ${container_path} (${dev_type} ${major}:${minor}) in pid ${INIT_PID}"
         FAIL_COUNT=$((FAIL_COUNT + 1))
     fi
 done <<< "${ENTRIES}"
 
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
-    log_error "${FAIL_COUNT} device mount(s) failed"
+    log_error "${FAIL_COUNT} device node(s) failed"
     exit 1
 fi
 
-log_info "Device remount completed successfully"
+log_info "Device node restore completed successfully"
 exit 0

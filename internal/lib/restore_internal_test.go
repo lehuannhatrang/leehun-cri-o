@@ -117,3 +117,45 @@ func TestContainerServerHAMiVGPUMountPrefixes(t *testing.T) {
 		t.Fatalf("expected configured prefixes, got %v", got)
 	}
 }
+
+// Checkpoints taken from a container restored by a CRI-O build that
+// bind-mounted every device onto itself carry one external mount per device.
+// CRIU needs an ext-mount-map entry for each of them, otherwise restore fails
+// with "No mapping for <id>:<path> mountpoint".
+
+func TestBuildDeviceExtMountMapLines(t *testing.T) {
+	mappings := []deviceMapping{
+		{HostPath: "/dev/nvidia-modeset", ContainerPath: "/dev/nvidia-modeset"},
+		{HostPath: "/dev/dri/card1", ContainerPath: "/dev/dri/card1"},
+	}
+
+	got := buildDeviceExtMountMapLines(mappings)
+	want := "ext-mount-map /dev/nvidia-modeset:/dev/nvidia-modeset\n" +
+		"ext-mount-map /dev/dri/card1:/dev/dri/card1\n"
+
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestBuildDeviceExtMountMapLinesSkipsDuplicatesAndEmptyPaths(t *testing.T) {
+	mappings := []deviceMapping{
+		{HostPath: "/dev/nvidia0", ContainerPath: "/dev/nvidia0"},
+		{HostPath: "/dev/nvidia0", ContainerPath: "/dev/nvidia0"},
+		{HostPath: "", ContainerPath: "/dev/nvidia1"},
+		{HostPath: "/dev/nvidia2", ContainerPath: ""},
+	}
+
+	got := buildDeviceExtMountMapLines(mappings)
+	want := "ext-mount-map /dev/nvidia0:/dev/nvidia0\n"
+
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestBuildDeviceExtMountMapLinesNoDevices(t *testing.T) {
+	if got := buildDeviceExtMountMapLines(nil); got != "" {
+		t.Fatalf("expected no lines without devices, got %q", got)
+	}
+}

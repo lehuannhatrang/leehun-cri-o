@@ -448,6 +448,36 @@ type deviceMapping struct {
 	FileMode os.FileMode `json:"file_mode,omitempty"`
 }
 
+// buildDeviceExtMountMapLines returns one "ext-mount-map <path>:<path>" line
+// per device in mappings.
+//
+// A checkpoint taken from a container that was itself restored by a CRI-O
+// build whose action script bind-mounted every device onto itself carries one
+// extra mount entry per device under /dev. CRIU records those as external
+// mounts keyed by the device path and refuses to restore them without a
+// mapping, failing with "No mapping for <id>:<path> mountpoint". Mapping each
+// device path onto itself lets those checkpoints restore; CRIU ignores
+// ext-mount-map entries that the checkpoint does not reference, so the lines
+// are harmless for checkpoints that never carried the extra mounts.
+func buildDeviceExtMountMapLines(mappings []deviceMapping) string {
+	var (
+		b    strings.Builder
+		seen = make(map[string]bool)
+	)
+
+	for _, m := range mappings {
+		if m.ContainerPath == "" || m.HostPath == "" || seen[m.ContainerPath] {
+			continue
+		}
+
+		seen[m.ContainerPath] = true
+
+		fmt.Fprintf(&b, "ext-mount-map %s:%s\n", m.ContainerPath, m.HostPath)
+	}
+
+	return b.String()
+}
+
 // injectCDIDevicesForRestore merges CDI device names from NVIDIA_VISIBLE_DEVICES
 // (and CDI annotations) into the OCI spec via cdi.InjectDevices.
 func injectCDIDevicesForRestore(ctx context.Context, ctrSpec *generate.Generator) {
@@ -523,23 +553,12 @@ func injectCDIDevicesForRestore(ctx context.Context, ctrSpec *generate.Generator
 // sources from the checkpoint; the function pairs them with the current
 // HAMi vGPU sources found in ctrSpec and adds CRIU ext-mount-map entries
 // so that mounts marked external in the checkpoint can be re-bound from
-// the new host paths.
+// the new host paths. Device paths get an ext-mount-map entry as well, see
+// buildDeviceExtMountMapLines.
 //
 // Returns paths to the created files (empty strings if no devices to map).
 func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec *generate.Generator, hamiOldVGPUPaths, hamiVGPUPrefixes []string) (string, string, error) {
 	hamiExtMountLines := buildHAMiExtMountMapLines(ctx, hamiOldVGPUPaths, ctrSpec, hamiVGPUPrefixes)
-
-	// Verify the action script exists on disk.
-	if _, err := os.Stat(criuDeviceRestorerScript); err != nil {
-		log.Warnf(ctx, "CRIU device restorer script not found at %s, skipping device restore metadata: %v",
-			criuDeviceRestorerScript, err)
-		// Even without the device action script we still want CRIU to see
-		// the HAMi ext-mount-map entries, otherwise restore will fail with
-		// "No mapping for ... mountpoint".
-		if hamiExtMountLines == "" {
-			return "", "", nil
-		}
-	}
 
 	// Build device mapping entries from the OCI spec.
 	var mappings []deviceMapping
@@ -560,7 +579,19 @@ func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec
 		}
 	}
 
-	if len(mappings) == 0 && hamiExtMountLines == "" {
+	extMountLines := buildDeviceExtMountMapLines(mappings) + hamiExtMountLines
+
+	// Verify the action script exists on disk. Without it nothing consumes
+	// device-mapping.json, but CRIU still needs to see the ext-mount-map
+	// entries, otherwise restore fails with "No mapping for ... mountpoint".
+	if _, err := os.Stat(criuDeviceRestorerScript); err != nil {
+		log.Warnf(ctx, "CRIU device restorer script not found at %s, skipping device node restore: %v",
+			criuDeviceRestorerScript, err)
+
+		mappings = nil
+	}
+
+	if len(mappings) == 0 && extMountLines == "" {
 		log.Debugf(ctx, "No devices to map for container %s, skipping device restore metadata", ctr.ID())
 		return "", "", nil
 	}
@@ -606,7 +637,7 @@ func writeDeviceRestoreMetadata(ctx context.Context, ctr *oci.Container, ctrSpec
 		criuConfigContent = "tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 104857600\nenable-external-masters\n"
 	}
 
-	criuConfigContent += hamiExtMountLines
+	criuConfigContent += extMountLines
 
 	configPath := filepath.Join(checkpointDir, criuConfigFile)
 	if err := os.WriteFile(configPath, []byte(criuConfigContent), 0o600); err != nil {
