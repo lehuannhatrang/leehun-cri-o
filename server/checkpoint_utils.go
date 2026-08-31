@@ -428,20 +428,77 @@ func buildContainerConfig(
 		if dumpSpec.Linux.ReadonlyPaths != nil {
 			containerConfig.Linux.SecurityContext.ReadonlyPaths = dumpSpec.Linux.ReadonlyPaths
 		}
-		// Add devices (skip NVIDIA devices - handled by CDI)
-		for _, d := range dumpSpec.Linux.Devices {
-			if strings.HasPrefix(d.Path, "/dev/nvidia") {
-				continue
-			}
-			containerConfig.Devices = append(containerConfig.Devices, &types.Device{
-				ContainerPath: d.Path,
-				HostPath:      d.Path,
-				Permissions:   "rw",
-			})
+	}
+
+	containerConfig.Devices = buildRestoreDevices(createConfig.GetDevices(), dumpSpec)
+
+	return containerConfig
+}
+
+// cdiManagedDevicePrefixes lists the device node paths that CDI (re)injects
+// during restore: the NVIDIA device nodes plus the DRM card and render nodes
+// that the NVIDIA CDI spec pairs with every GPU. Their minor numbers identify
+// one specific GPU, so copying them from the checkpoint would pin the restored
+// container to the GPU of the previous run instead of the one allocated to it
+// now.
+var cdiManagedDevicePrefixes = []string{
+	"/dev/nvidia",
+	"/dev/dri/",
+}
+
+// isCDIManagedDevice reports whether a device node is provided by CDI during
+// restore and must therefore not be carried over from the checkpoint.
+func isCDIManagedDevice(path string) bool {
+	for _, prefix := range cdiManagedDevicePrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
 		}
 	}
 
-	return containerConfig
+	return false
+}
+
+// buildRestoreDevices determines the device nodes of the restored container.
+//
+// The devices of the restore request describe the allocation made for this run
+// and always win. The checkpoint only contributes devices the request does not
+// mention and that CDI does not manage, so devices no plugin re-requests (a
+// plain /dev/fuse from the original pod spec, for example) still survive the
+// restore.
+func buildRestoreDevices(createDevices []*types.Device, dumpSpec *spec.Spec) []*types.Device {
+	var devices []*types.Device
+
+	seen := make(map[string]bool, len(createDevices))
+
+	for _, d := range createDevices {
+		if d.GetContainerPath() == "" || seen[d.GetContainerPath()] {
+			continue
+		}
+
+		seen[d.GetContainerPath()] = true
+
+		devices = append(devices, d)
+	}
+
+	if dumpSpec.Linux == nil {
+		return devices
+	}
+
+	for _, d := range dumpSpec.Linux.Devices {
+		if seen[d.Path] || isCDIManagedDevice(d.Path) {
+			continue
+		}
+
+		seen[d.Path] = true
+
+		devices = append(devices, &types.Device{
+			ContainerPath: d.Path,
+			HostPath:      d.Path,
+			Permissions:   "rw",
+		})
+	}
+
+	return devices
 }
 
 // processMounts processes checkpoint mounts and returns container mounts + missing mounts
