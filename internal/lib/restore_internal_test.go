@@ -316,6 +316,90 @@ func TestRewriteHAMiVGPUEnvWithoutProcess(t *testing.T) {
 	}})
 }
 
+func TestExtractHAMiSharedCache(t *testing.T) {
+	spec := &rspec.Spec{Process: &rspec.Process{Env: []string{
+		"HOME=/home/jovyan",
+		"CUDA_DEVICE_MEMORY_SHARED_CACHE=/usr/local/vgpu/containers/old-uid_kernel/old-cache.cache",
+	}}}
+
+	if got := extractHAMiSharedCache(spec); got != "/usr/local/vgpu/containers/old-uid_kernel/old-cache.cache" {
+		t.Fatalf("unexpected shared cache %q", got)
+	}
+
+	if got := extractHAMiSharedCache(&rspec.Spec{}); got != "" {
+		t.Fatalf("expected no shared cache without a process, got %q", got)
+	}
+}
+
+// HAMi names the shared-region file after a UUID that changes with every pod,
+// so moving only the directory leaves exec'ed processes on a second region.
+// The whole value has to be the checkpointed one, while the limits stay those
+// of the current allocation.
+func TestRestoreHAMiSharedCacheEnv(t *testing.T) {
+	g := &generate.Generator{Config: &rspec.Spec{
+		Process: &rspec.Process{
+			Env: []string{
+				"CUDA_DEVICE_MEMORY_SHARED_CACHE=/usr/local/vgpu/containers/old-uid_kernel/new-cache.cache",
+				"CUDA_DEVICE_MEMORY_LIMIT_0=16384m",
+				"CUDA_DEVICE_SM_LIMIT_0=40",
+			},
+		},
+	}}
+
+	restoreHAMiSharedCacheEnv(context.Background(), g,
+		"/usr/local/vgpu/containers/old-uid_kernel/old-cache.cache",
+		[]hamiVGPUMount{{
+			Destination: "/usr/local/vgpu/containers/old-uid_kernel",
+			Source:      "/usr/local/vgpu/containers/new-uid_kernel",
+		}})
+
+	want := []string{
+		"CUDA_DEVICE_MEMORY_SHARED_CACHE=/usr/local/vgpu/containers/old-uid_kernel/old-cache.cache",
+		"CUDA_DEVICE_MEMORY_LIMIT_0=16384m",
+		"CUDA_DEVICE_SM_LIMIT_0=40",
+	}
+	if !reflect.DeepEqual(g.Config.Process.Env, want) {
+		t.Fatalf("expected %v, got %v", want, g.Config.Process.Env)
+	}
+}
+
+func TestRestoreHAMiSharedCacheEnvOutsideMountpoint(t *testing.T) {
+	env := []string{"CUDA_DEVICE_MEMORY_SHARED_CACHE=/usr/local/vgpu/containers/new-uid_kernel/new-cache.cache"}
+	g := &generate.Generator{Config: &rspec.Spec{Process: &rspec.Process{Env: slices.Clone(env)}}}
+
+	restoreHAMiSharedCacheEnv(context.Background(), g,
+		"/somewhere/else/old-cache.cache",
+		[]hamiVGPUMount{{
+			Destination: "/usr/local/vgpu/containers/old-uid_kernel",
+			Source:      "/usr/local/vgpu/containers/new-uid_kernel",
+		}})
+
+	if !reflect.DeepEqual(g.Config.Process.Env, env) {
+		t.Fatalf("expected env to stay %v, got %v", env, g.Config.Process.Env)
+	}
+}
+
+func TestRestoreHAMiSharedCacheEnvNothingToDo(t *testing.T) {
+	env := []string{"HOME=/home/jovyan"}
+	g := &generate.Generator{Config: &rspec.Spec{Process: &rspec.Process{Env: slices.Clone(env)}}}
+	mounts := []hamiVGPUMount{{
+		Destination: "/usr/local/vgpu/containers/old-uid_kernel",
+		Source:      "/usr/local/vgpu/containers/new-uid_kernel",
+	}}
+
+	// No checkpointed value, no mounts, and a spec without the variable must
+	// all leave the environment alone.
+	restoreHAMiSharedCacheEnv(context.Background(), g, "", mounts)
+	restoreHAMiSharedCacheEnv(context.Background(), g, "/usr/local/vgpu/containers/old-uid_kernel/c.cache", nil)
+	restoreHAMiSharedCacheEnv(context.Background(), g, "/usr/local/vgpu/containers/old-uid_kernel/c.cache", mounts)
+	restoreHAMiSharedCacheEnv(context.Background(), &generate.Generator{Config: &rspec.Spec{}},
+		"/usr/local/vgpu/containers/old-uid_kernel/c.cache", mounts)
+
+	if !reflect.DeepEqual(g.Config.Process.Env, env) {
+		t.Fatalf("expected env to stay %v, got %v", env, g.Config.Process.Env)
+	}
+}
+
 // The org.criu.config annotation stays in the container's runtime state after
 // the restore, so the file it points at is handed to CRIU again at the next
 // checkpoint. It must therefore only carry options that are valid for a dump:

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	metadata "github.com/checkpoint-restore/checkpointctl/lib"
@@ -55,6 +56,10 @@ const (
 	// (re)created, so during checkpoint/restore we must remap the original
 	// path via CRIU's ext-mount-map.
 	hamiDRALabel = "hami.io/dra"
+
+	// hamiSharedCacheEnv is the variable libvgpu reads the path of its shared
+	// accounting region from.
+	hamiSharedCacheEnv = "CUDA_DEVICE_MEMORY_SHARED_CACHE"
 )
 
 // ContainerRestore restores a checkpointed container.
@@ -109,6 +114,11 @@ func (c *ContainerServer) ContainerRestore(
 	// allocated, differently named host directory to back them with.
 	var hamiCheckpointDests []string
 
+	// hamiCheckpointSharedCache is the HAMi shared-region path the checkpointed
+	// processes carry in their environment. The restored processes keep using
+	// it, so exec'ed processes have to be pointed at the very same file.
+	var hamiCheckpointSharedCache string
+
 	// hamiVGPUPrefixes is the operator-configurable set of directory prefixes
 	// under which HAMi creates the per-allocation directories that must be
 	// remapped on restore.
@@ -160,7 +170,10 @@ func (c *ContainerServer) ContainerRestore(
 			// Pick up the HAMi vGPU mountpoints before we drop access to
 			// the checkpoint image.
 			if isHAMiPod(sb) {
-				hamiCheckpointDests = readHAMiVGPUDestinationsFromImage(ctx, imageMountPoint, hamiVGPUPrefixes)
+				if dumpSpec := readCheckpointSpecFromImage(ctx, imageMountPoint); dumpSpec != nil {
+					hamiCheckpointDests = extractHAMiVGPUDestinations(dumpSpec, hamiVGPUPrefixes)
+					hamiCheckpointSharedCache = extractHAMiSharedCache(dumpSpec)
+				}
 			}
 		} else {
 			if err := crutils.CRImportCheckpointWithoutConfig(ctr.Dir(), ctr.RestoreArchivePath()); err != nil {
@@ -168,7 +181,10 @@ func (c *ContainerServer) ContainerRestore(
 			}
 
 			if isHAMiPod(sb) {
-				hamiCheckpointDests = readHAMiVGPUDestinationsFromArchive(ctx, ctr.RestoreArchivePath(), hamiVGPUPrefixes)
+				if dumpSpec := readCheckpointSpecFromArchive(ctx, ctr.RestoreArchivePath()); dumpSpec != nil {
+					hamiCheckpointDests = extractHAMiVGPUDestinations(dumpSpec, hamiVGPUPrefixes)
+					hamiCheckpointSharedCache = extractHAMiSharedCache(dumpSpec)
+				}
 			}
 		}
 
@@ -354,6 +370,7 @@ func (c *ContainerServer) ContainerRestore(
 	// the runtime, CRIU and the restored processes all agree on one mountpoint.
 	hamiMounts := alignHAMiVGPUMounts(ctx, &ctrSpec, hamiCheckpointDests, hamiVGPUPrefixes)
 	rewriteHAMiVGPUEnv(&ctrSpec, hamiMounts)
+	restoreHAMiSharedCacheEnv(ctx, &ctrSpec, hamiCheckpointSharedCache, hamiMounts)
 
 	// Generate device mapping metadata and CRIU config for the action script.
 	// This must happen before saving config.json so the annotation is included.
@@ -370,6 +387,12 @@ func (c *ContainerServer) ContainerRestore(
 	if err := ctrSpec.SaveToFile(filepath.Join(ctr.BundlePath(), "config.json"), saveOptions); err != nil {
 		return "", err
 	}
+
+	// Exec'ed processes take their environment from the in-memory spec, which
+	// still holds the one built for a fresh start. Keep it in line with the
+	// config.json the restored container runs with, or the HAMi remapping
+	// above never reaches them.
+	syncExecEnv(ctr, &ctrSpec)
 
 	restoreErr := c.runtime.RestoreContainer(
 		ctx,
@@ -703,10 +726,9 @@ type hamiVGPUMount struct {
 	Source      string
 }
 
-// readHAMiVGPUDestinationsFromImage reads spec.dump from an already-mounted
-// checkpoint OCI image and returns the mountpoints of the HAMi vGPU bind
-// mounts recorded in it.
-func readHAMiVGPUDestinationsFromImage(ctx context.Context, imageMountPoint string, prefixes []string) []string {
+// readCheckpointSpecFromImage reads spec.dump from an already-mounted
+// checkpoint OCI image. Returns nil when it cannot be read.
+func readCheckpointSpecFromImage(ctx context.Context, imageMountPoint string) *rspec.Spec {
 	var dumpSpec rspec.Spec
 
 	if _, err := metadata.ReadJSONFile(&dumpSpec, imageMountPoint, metadata.SpecDumpFile); err != nil {
@@ -715,13 +737,13 @@ func readHAMiVGPUDestinationsFromImage(ctx context.Context, imageMountPoint stri
 		return nil
 	}
 
-	return extractHAMiVGPUDestinations(&dumpSpec, prefixes)
+	return &dumpSpec
 }
 
-// readHAMiVGPUDestinationsFromArchive extracts spec.dump from a checkpoint tar
+// readCheckpointSpecFromArchive extracts spec.dump from a checkpoint tar
 // archive (without disturbing the main restore extraction, which omits
-// spec.dump) and returns the HAMi vGPU mountpoints recorded in it.
-func readHAMiVGPUDestinationsFromArchive(ctx context.Context, archivePath string, prefixes []string) []string {
+// spec.dump). Returns nil when it cannot be read.
+func readCheckpointSpecFromArchive(ctx context.Context, archivePath string) *rspec.Spec {
 	tmpDir, err := os.MkdirTemp("", "crio-hami-spec-")
 	if err != nil {
 		log.Warnf(ctx, "Failed to create temp dir for HAMi spec.dump: %v", err)
@@ -745,7 +767,7 @@ func readHAMiVGPUDestinationsFromArchive(ctx context.Context, archivePath string
 		return nil
 	}
 
-	return extractHAMiVGPUDestinations(&dumpSpec, prefixes)
+	return &dumpSpec
 }
 
 // hasHAMiVGPUPrefix reports whether the given path lives under one of the
@@ -914,6 +936,79 @@ func rewriteHAMiVGPUEnv(ctrSpec *generate.Generator, mounts []hamiVGPUMount) {
 
 		for i, env := range ctrSpec.Config.Process.Env {
 			ctrSpec.Config.Process.Env[i] = strings.ReplaceAll(env, m.Source, m.Destination)
+		}
+	}
+}
+
+// syncExecEnv copies the process environment of the restored spec into the
+// container's in-memory spec, which is what exec'ed processes are started
+// with. The rest of the in-memory spec is left as it is.
+func syncExecEnv(ctr *oci.Container, ctrSpec *generate.Generator) {
+	if ctrSpec == nil || ctrSpec.Config == nil || ctrSpec.Config.Process == nil {
+		return
+	}
+
+	spec := ctr.Spec()
+	if spec.Process == nil {
+		return
+	}
+
+	process := *spec.Process
+	process.Env = slices.Clone(ctrSpec.Config.Process.Env)
+	spec.Process = &process
+
+	ctr.SetSpec(&spec)
+}
+
+// extractHAMiSharedCache returns the value of the HAMi shared-region variable
+// recorded in the given spec, or an empty string when it is not set.
+func extractHAMiSharedCache(s *rspec.Spec) string {
+	if s == nil || s.Process == nil {
+		return ""
+	}
+
+	for _, env := range s.Process.Env {
+		if value, ok := strings.CutPrefix(env, hamiSharedCacheEnv+"="); ok {
+			return value
+		}
+	}
+
+	return ""
+}
+
+// restoreHAMiSharedCacheEnv sets the HAMi shared-region variable of the
+// restored spec to the value the checkpointed processes carry.
+//
+// libvgpu keeps its per-container accounting in one shared file, and HAMi names
+// that file after a UUID that changes with every pod. rewriteHAMiVGPUEnv only
+// moves the directory part to the checkpointed mountpoint, which would leave
+// exec'ed processes opening a second, differently named file next to the one
+// the restored processes use: two regions with separate accounting. The memory
+// and SM limits are left alone, so a process exec'ed into the restored
+// container still carries the limits of the current allocation.
+//
+// The checkpointed value is only taken over when its directory is one of the
+// mountpoints the restored container actually has.
+func restoreHAMiSharedCacheEnv(ctx context.Context, ctrSpec *generate.Generator, checkpointed string, mounts []hamiVGPUMount) {
+	if checkpointed == "" || len(mounts) == 0 || ctrSpec == nil || ctrSpec.Config == nil || ctrSpec.Config.Process == nil {
+		return
+	}
+
+	if !slices.ContainsFunc(mounts, func(m hamiVGPUMount) bool {
+		return filepath.Clean(m.Destination) == filepath.Dir(checkpointed)
+	}) {
+		log.Warnf(ctx, "Checkpointed %s=%s is not below a restored HAMi vGPU mountpoint; leaving it unchanged",
+			hamiSharedCacheEnv, checkpointed)
+
+		return
+	}
+
+	for i, env := range ctrSpec.Config.Process.Env {
+		if strings.HasPrefix(env, hamiSharedCacheEnv+"=") {
+			ctrSpec.Config.Process.Env[i] = hamiSharedCacheEnv + "=" + checkpointed
+			log.Infof(ctx, "HAMi shared region of exec'ed processes set to the checkpointed %s", checkpointed)
+
+			return
 		}
 	}
 }
