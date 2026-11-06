@@ -111,3 +111,77 @@ func TestBuildRestoreDevicesWithoutLinuxSection(t *testing.T) {
 		t.Fatalf("expected %v, got %v", want, got)
 	}
 }
+
+func TestProcessMountsKeepsPodSuppliedDevShm(t *testing.T) {
+	dumpSpec := &spec.Spec{Mounts: []spec.Mount{
+		{Destination: "/dev/shm", Source: "/var/lib/kubelet/pods/old/volumes/kubernetes.io~empty-dir/shared-mem"},
+		{Destination: "/proc", Source: "proc"},
+		{Destination: "/workspace", Source: "/var/lib/kubelet/pods/old/volumes/kubernetes.io~configmap/workspace"},
+	}}
+	createMounts := []*types.Mount{
+		{ContainerPath: "/dev/shm", HostPath: "/var/lib/kubelet/pods/new/volumes/kubernetes.io~empty-dir/shared-mem"},
+		{ContainerPath: "/workspace", HostPath: "/var/lib/kubelet/pods/new/volumes/kubernetes.io~configmap/workspace", Readonly: true},
+	}
+
+	mounts, missing := processMounts(t.Context(), dumpSpec, createMounts, &NVIDIADriverInfo{})
+	if len(missing) != 0 {
+		t.Fatalf("unexpected missing mounts %v", missing)
+	}
+
+	got := map[string]string{}
+	for _, m := range mounts {
+		got[m.GetContainerPath()] = m.GetHostPath()
+	}
+
+	if got["/dev/shm"] != createMounts[0].GetHostPath() {
+		t.Fatalf("/dev/shm = %q, want the pod's emptyDir %q", got["/dev/shm"], createMounts[0].GetHostPath())
+	}
+
+	if _, ok := got["/proc"]; ok {
+		t.Fatal("/proc must stay ignored")
+	}
+
+	if len(mounts) != 2 {
+		t.Fatalf("got %d mounts, want 2: %v", len(mounts), got)
+	}
+}
+
+func TestProcessMountsDevShmWithoutPodVolume(t *testing.T) {
+	// No volume at /dev/shm in the request: CRI-O's own sandbox shm is used,
+	// so the checkpointed /dev/shm is neither kept nor reported missing.
+	dumpSpec := &spec.Spec{Mounts: []spec.Mount{
+		{Destination: "/dev/shm", Source: "/run/containers/storage/overlay-containers/x/userdata/shm"},
+	}}
+
+	mounts, missing := processMounts(t.Context(), dumpSpec, nil, &NVIDIADriverInfo{})
+	if len(mounts) != 0 || len(missing) != 0 {
+		t.Fatalf("mounts=%v missing=%v, want none", mounts, missing)
+	}
+}
+
+func TestUpdateAnnotationsRefreshesRestartCount(t *testing.T) {
+	original := map[string]string{
+		"io.kubernetes.pod.uid":                "old-uid",
+		"io.kubernetes.container.hash":         "old-hash",
+		"io.kubernetes.container.restartCount": "0",
+		"io.kubernetes.container.ports":        "[]",
+	}
+	create := map[string]string{
+		"io.kubernetes.container.hash":         "new-hash",
+		"io.kubernetes.container.restartCount": "3",
+	}
+
+	updateAnnotations(original, "new-uid", create)
+
+	want := map[string]string{
+		"io.kubernetes.pod.uid":                "new-uid",
+		"io.kubernetes.container.hash":         "new-hash",
+		"io.kubernetes.container.restartCount": "3",
+		"io.kubernetes.container.ports":        "[]",
+	}
+	for k, v := range want {
+		if original[k] != v {
+			t.Errorf("%s = %q, want %q", k, original[k], v)
+		}
+	}
+}

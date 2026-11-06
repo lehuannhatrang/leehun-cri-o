@@ -481,3 +481,41 @@ func TestBuildDeviceExtMountMapLinesNoDevices(t *testing.T) {
 		t.Fatalf("expected no lines without devices, got %q", got)
 	}
 }
+
+// A pod that declares its HAMi ResourceClaim itself never gets the
+// hami.io/dra label from the webhook; the CDI-provided vGPU mount still marks
+// it as a HAMi container that needs the remap.
+func TestSpecHasHAMiVGPUMount(t *testing.T) {
+	for name, tc := range map[string]struct {
+		mounts []rspec.Mount
+		want   bool
+	}{
+		"legacy containers dir": {
+			mounts: []rspec.Mount{{
+				Source:      "/usr/local/vgpu/containers/f8c04606-97ae-4349-97a4-d6d82a756263_trainer",
+				Destination: "/usr/local/vgpu/containers/f8c04606-97ae-4349-97a4-d6d82a756263_trainer",
+			}},
+			want: true,
+		},
+		"claims dir": {
+			mounts: []rspec.Mount{{Source: "/usr/local/vgpu/claims/3f1c9a2e-uid", Destination: "/usr/local/vgpu/claims/3f1c9a2e-uid"}},
+			want:   true,
+		},
+		"libvgpu only": {
+			mounts: []rspec.Mount{{Source: "/usr/local/vgpu/libvgpu.so", Destination: "/usr/local/vgpu/libvgpu.so"}},
+			want:   false,
+		},
+		"no mounts": {want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := &generate.Generator{Config: &rspec.Spec{Mounts: tc.mounts}}
+			if got := specHasHAMiVGPUMount(g, testHAMiVGPUPrefixes); got != tc.want {
+				t.Fatalf("specHasHAMiVGPUMount() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	if specHasHAMiVGPUMount(nil, testHAMiVGPUPrefixes) {
+		t.Fatal("nil spec must not be treated as HAMi")
+	}
+}

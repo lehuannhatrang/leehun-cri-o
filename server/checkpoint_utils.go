@@ -324,6 +324,13 @@ var ignoredMounts = map[string]bool{
 	"/run/.containerenv": true,
 }
 
+// userMountableIgnoredMounts lists the ignoredMounts a pod can replace with a
+// volume of its own; the restore keeps the pod's volume there when the
+// request supplies one.
+var userMountableIgnoredMounts = map[string]bool{
+	"/dev/shm": true,
+}
+
 // tarExcludePatterns defines files to exclude when extracting checkpoint metadata
 var tarExcludePatterns = []string{
 	"artifacts",
@@ -377,8 +384,21 @@ func updateAnnotations(originalAnnotations map[string]string, sandboxUID string,
 		if ok1 && ok2 {
 			originalAnnotations["io.kubernetes.container.hash"] = createAnnotations["io.kubernetes.container.hash"]
 		}
+
+		// kubelet derives the next attempt number from the restart count it
+		// reads back from the running container. Keeping the checkpoint's value
+		// makes it ask for an attempt it already used once the restored
+		// container exits, and every later create fails with "name is
+		// reserved" -- the pod never recovers.
+		if v, ok := createAnnotations[containerRestartCountAnnotation]; ok {
+			originalAnnotations[containerRestartCountAnnotation] = v
+		}
 	}
 }
+
+// containerRestartCountAnnotation is the kubelet-owned annotation carrying the
+// container's restart count.
+const containerRestartCountAnnotation = "io.kubernetes.container.restartCount"
 
 // buildContainerConfig creates a container config for restore
 func buildContainerConfig(
@@ -513,6 +533,20 @@ func processMounts(
 
 	for _, m := range dumpSpec.Mounts {
 		if ignoredMounts[m.Destination] {
+			// CRI-O provides these itself, except where the pod mounts its own
+			// volume over one: a memory emptyDir at /dev/shm is the usual way to
+			// give a container more than the sandbox's 64 MiB. Dropping it
+			// would put the restored container on the 64 MiB sandbox shm while
+			// CRIU recorded the larger tmpfs, and anything sizing itself to the
+			// original (NCCL's shared-memory transport, DataLoader workers) runs
+			// out of space after the restore.
+			if userMountableIgnoredMounts[m.Destination] {
+				if mount := findMatchingMount(m.Destination, createMounts); mount != nil {
+					log.Debugf(ctx, "Keeping pod-supplied mount %#v", mount)
+					mounts = append(mounts, mount)
+				}
+			}
+
 			continue
 		}
 

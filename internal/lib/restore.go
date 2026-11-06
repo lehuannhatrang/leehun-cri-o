@@ -124,6 +124,10 @@ func (c *ContainerServer) ContainerRestore(
 	// remapped on restore.
 	hamiVGPUPrefixes := c.hamiVGPUMountPrefixes()
 
+	// Decided once, before the checkpoint is unpacked: reading spec.dump is
+	// only worth it for a container HAMi hands a vGPU directory to.
+	hamiRestore := isHAMiPod(sb) || specHasHAMiVGPUMount(&ctrSpec, hamiVGPUPrefixes)
+
 	if ctr.RestoreArchivePath() != "" || ctr.RestoreStorageImageID() != nil {
 		if ctr.RestoreStorageImageID() != nil {
 			log.Debugf(ctx, "Restoring from %v", ctr.RestoreStorageImageID())
@@ -169,7 +173,7 @@ func (c *ContainerServer) ContainerRestore(
 
 			// Pick up the HAMi vGPU mountpoints before we drop access to
 			// the checkpoint image.
-			if isHAMiPod(sb) {
+			if hamiRestore {
 				if dumpSpec := readCheckpointSpecFromImage(ctx, imageMountPoint); dumpSpec != nil {
 					hamiCheckpointDests = extractHAMiVGPUDestinations(dumpSpec, hamiVGPUPrefixes)
 					hamiCheckpointSharedCache = extractHAMiSharedCache(dumpSpec)
@@ -180,7 +184,7 @@ func (c *ContainerServer) ContainerRestore(
 				return "", err
 			}
 
-			if isHAMiPod(sb) {
+			if hamiRestore {
 				if dumpSpec := readCheckpointSpecFromArchive(ctx, ctr.RestoreArchivePath()); dumpSpec != nil {
 					hamiCheckpointDests = extractHAMiVGPUDestinations(dumpSpec, hamiVGPUPrefixes)
 					hamiCheckpointSharedCache = extractHAMiSharedCache(dumpSpec)
@@ -712,6 +716,28 @@ func isHAMiPod(sb *sandbox.Sandbox) bool {
 	}
 
 	return sb.Labels()[hamiDRALabel] == "true"
+}
+
+// specHasHAMiVGPUMount reports whether the spec bind-mounts a HAMi vGPU
+// per-allocation directory, i.e. whether HAMi's CDI spec was applied to it.
+//
+// This catches HAMi containers whose pod lacks the hami.io/dra label: the
+// label is set by the HAMi mutating webhook, so pods in namespaces the webhook
+// skips, pods created while it was down and pods declaring the
+// ResourceClaim themselves never get it. Without it the vGPU mount is not
+// remapped and CRIU fails with "No mapping for <id>:(null) mountpoint".
+func specHasHAMiVGPUMount(ctrSpec *generate.Generator, prefixes []string) bool {
+	if ctrSpec == nil || ctrSpec.Config == nil {
+		return false
+	}
+
+	for _, m := range ctrSpec.Config.Mounts {
+		if hasHAMiVGPUPrefix(m.Source, prefixes) || hasHAMiVGPUPrefix(m.Destination, prefixes) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // hamiVGPUMount pairs the path a HAMi vGPU directory is mounted at inside the
